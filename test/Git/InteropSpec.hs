@@ -134,6 +134,7 @@ stageFileAt entries repository relativePath contents = do
                     , indexEntryMode = RegularFile
                     , indexEntrySize = fromIntegral (BS.length payload)
                     , indexEntryObjectId = objectId
+                    , indexEntryStage = 0
                     }
                ]
         )

@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               haskell-git
-version:            0.1.0.0
+version:            0.2.0.0
 
 synopsis:           Clone, inspect, and verify Git repositories
 description:
@@ -25,6 +25,7 @@ extra-source-files:
     docs/figures/*.excalidraw
     docs/figures/*.png
     docs/figures/gen_figures.py
+    scripts/memory-benchmark.sh
 
 source-repository head
     type:     git
@@ -38,8 +39,12 @@ library
 
     exposed-modules:
         Git.Clone
+        Git.Commit
+        Git.Config
+        Git.Fetch
         Git.Hash
         Git.Index
+        Git.Merge
         Git.Object
         Git.Object.Blob
         Git.Object.Commit
@@ -49,24 +54,40 @@ library
         Git.Object.Tree
         Git.Pack
         Git.Pack.Delta
+        Git.Pack.Import
         Git.Pack.Index
         Git.Pack.Read
+        Git.Pack.Stream
+        Git.Pack.Write
         Git.Protocol.PacketLine
         Git.Protocol.SmartHTTP
+        Git.Pull
+        Git.Push
+        Git.Rebase
         Git.Refs
+        Git.RefSpec
         Git.Repo
         Git.Store
+        Git.Submodule
+        Git.Transport
         Git.Verify
+        Git.Worktree
 
     build-depends:
         base >=4.18 && <5,
         bytestring >=0.11 && <0.13,
+        case-insensitive >=1.0 && <1.3,
         containers >=0.6 && <0.8,
         cryptohash-sha1 >=0.11 && <0.12,
+        cryptohash-sha256 >=0.11 && <0.12,
         directory >=1.3.6 && <1.4,
         filepath >=1.4 && <1.6,
+        http-client >=0.7 && <0.8,
+        http-client-tls >=0.3 && <0.4,
         http-conduit >=2.3 && <2.4,
         http-types >=0.12 && <0.13,
+        network >=3.1 && <3.3,
+        process >=1.6 && <1.7,
         time >=1.9 && <1.15,
         zlib >=0.6 && <0.9
 
@@ -98,9 +119,12 @@ test-suite haskell-git-test
     type:             exitcode-stdio-1.0
     main-is:          Spec.hs
     other-modules:
+        Git.AuthSpec
         Git.CloneSpec
+        Git.FetchSpec
         Git.IndexSpec
         Git.InteropSpec
+        Git.MergeSpec
         Git.Object.BlobSpec
         Git.Object.CommitSpec
         Git.Object.TagSpec
@@ -108,13 +132,20 @@ test-suite haskell-git-test
         Git.Pack.DeltaSpec
         Git.Pack.IndexSpec
         Git.Pack.ReadSpec
+        Git.Pack.StreamingSpec
         Git.PackSpec
         Git.Protocol.PacketLineSpec
         Git.Protocol.SmartHTTPSpec
+        Git.PushSpec
+        Git.RebaseSpec
         Git.RefsSpec
         Git.RepoSpec
+        Git.Sha256Spec
         Git.StoreSpec
+        Git.SubmoduleSpec
+        Git.TransportSpec
         Git.VerifySpec
+        Git.WorktreeSpec
         TestSupport
 
     build-depends:
@@ -123,7 +154,8 @@ test-suite haskell-git-test
         directory >=1.3.6 && <1.4,
         filepath >=1.4 && <1.6,
         haskell-git,
-        process >=1.6 && <1.7
+        process >=1.6 && <1.7,
+        zlib >=0.6 && <0.9
 
     hs-source-dirs:   test
 

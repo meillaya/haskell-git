@@ -1,8 +1,10 @@
 module Git.Pack.Read
     ( PackRawObject (..)
     , decodeObjectHeader
+    , decodeOffsetDeltaBase
     , decompressMember
     , parsePackObjectAt
+    , parsePackObjectAtFor
     ) where
 
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, testBit)
@@ -11,7 +13,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Codec.Compression.Zlib.Internal as ZlibInternal
 import Data.Word (Word8)
-import Git.Hash (ObjectId, objectIdFromBytes, objectIdLength)
+import Git.Hash (HashAlgorithm (..), ObjectId, objectIdFromBytesFor, objectIdLengthFor)
 import Git.Pack (PackObjectKind (..), packObjectKind)
 
 -- | One parsed entry from a pack file. A delta entry stores the base reference
@@ -26,12 +28,16 @@ data PackRawObject
 -- total number of bytes the entry occupies, header and compressed stream
 -- included, so a caller walking a pack can advance past it.
 parsePackObjectAt :: ByteString -> Int -> Either String (PackRawObject, Int)
-parsePackObjectAt bytes offset
+parsePackObjectAt = parsePackObjectAtFor Sha1
+
+parsePackObjectAtFor :: HashAlgorithm -> ByteString -> Int -> Either String (PackRawObject, Int)
+parsePackObjectAtFor hashAlgorithm bytes offset
     | offset < 0 || offset >= BS.length bytes =
         Left "malformed pack: object offset is outside the file"
     | otherwise = do
         (objectKind, declaredSize, headerLength) <- decodeObjectHeader bytes offset
         let bodyStart = offset + headerLength
+            objectIdLength = objectIdLengthFor hashAlgorithm
         case objectKind of
             PackCommit -> parseFull PackCommit bodyStart declaredSize
             PackTree -> parseFull PackTree bodyStart declaredSize
@@ -58,7 +64,10 @@ parsePackObjectAt bytes offset
                     maybe
                         (Left "malformed pack: invalid reference delta base id")
                         Right
-                        (objectIdFromBytes (BS.take objectIdLength (BS.drop bodyStart bytes)))
+                        ( objectIdFromBytesFor
+                            hashAlgorithm
+                            (BS.take objectIdLength (BS.drop bodyStart bytes))
+                        )
                 let deltaStart = bodyStart + objectIdLength
                 (delta, consumed) <- decompressMember bytes deltaStart
                 if BS.length delta /= declaredSize

@@ -15,6 +15,7 @@
     pkg-config
     python3
     openssl
+    time
     zlib
   ];
 

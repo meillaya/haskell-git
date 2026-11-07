@@ -4,11 +4,13 @@ module Git.Object.Commit
     , commitAuthor
     , commitCommitter
     , commitFromObject
+    , commitFromObjectFor
     , commitMessage
     , commitParents
     , commitToObject
     , commitTree
     , decodeCommit
+    , decodeCommitFor
     , encodeCommit
     , module Git.Object.Person
     ) where
@@ -16,7 +18,7 @@ module Git.Object.Commit
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
-import Git.Hash (ObjectId, objectIdFromHex, objectIdToHex)
+import Git.Hash (HashAlgorithm (..), ObjectId, objectIdFromHexFor, objectIdToHex)
 import Git.Object (GitObject, GitObjectType (CommitObject), gitObject, gitObjectPayload, gitObjectType)
 import Git.Object.Person
 
@@ -50,7 +52,10 @@ encodeCommit currentCommit =
 -- headers are skipped here on purpose: callers that need a byte-exact object
 -- read the raw payload instead of round tripping through this type.
 decodeCommit :: ByteString -> Either String Commit
-decodeCommit rawCommit = do
+decodeCommit = decodeCommitFor Sha1
+
+decodeCommitFor :: HashAlgorithm -> ByteString -> Either String Commit
+decodeCommitFor hashAlgorithm rawCommit = do
     let (headerPart, messagePartWithSeparator) = BS8.breakSubstring (BS8.pack "\n\n") rawCommit
     if BS.null messagePartWithSeparator
         then Left "Malformed commit: missing header/message separator"
@@ -67,7 +72,7 @@ decodeCommit rawCommit = do
 
     parseRequiredObjectId prefix headerLines =
         case filter (hasPrefix prefix) headerLines of
-            [line] -> parseObjectIdLine prefix line
+            [line] -> parseObjectIdLine hashAlgorithm prefix line
             [] -> Left ("Malformed commit: missing " ++ prefix ++ " line")
             _ -> Left ("Malformed commit: duplicate " ++ prefix ++ " line")
 
@@ -77,11 +82,11 @@ decodeCommit rawCommit = do
             [] -> Left ("Malformed commit: missing " ++ prefix ++ " line")
             _ -> Left ("Malformed commit: duplicate " ++ prefix ++ " line")
 
-    parseParentLine = parseObjectIdLine "parent"
+    parseParentLine = parseObjectIdLine hashAlgorithm "parent"
 
-parseObjectIdLine :: String -> ByteString -> Either String ObjectId
-parseObjectIdLine prefix line =
-    case objectIdFromHex (BS8.unpack (BS.drop (length prefix + 1) line)) of
+parseObjectIdLine :: HashAlgorithm -> String -> ByteString -> Either String ObjectId
+parseObjectIdLine hashAlgorithm prefix line =
+    case objectIdFromHexFor hashAlgorithm (BS8.unpack (BS.drop (length prefix + 1) line)) of
         Nothing -> Left ("Malformed commit: invalid " ++ prefix ++ " object id")
         Just objectId -> Right objectId
 
@@ -95,7 +100,10 @@ commitToObject :: Commit -> GitObject
 commitToObject = gitObject CommitObject . encodeCommit
 
 commitFromObject :: GitObject -> Either String Commit
-commitFromObject currentObject =
+commitFromObject = commitFromObjectFor Sha1
+
+commitFromObjectFor :: HashAlgorithm -> GitObject -> Either String Commit
+commitFromObjectFor hashAlgorithm currentObject =
     if gitObjectType currentObject == CommitObject
-        then decodeCommit (gitObjectPayload currentObject)
+        then decodeCommitFor hashAlgorithm (gitObjectPayload currentObject)
         else Left "Expected a commit object"

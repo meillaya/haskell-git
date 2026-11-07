@@ -2,39 +2,78 @@ module Git.Hash
     ( HashAlgorithm (..)
     , ObjectId
     , defaultHashAlgorithm
+    , hashAlgorithmFromName
+    , hashAlgorithmName
     , hashBytes
+    , hashBytesFor
+    , hashSize
     , isZeroObjectId
     , objectIdBytes
     , objectIdFromBytes
+    , objectIdFromBytesFor
     , objectIdFromHex
+    , objectIdFromHexFor
     , objectIdLength
+    , objectIdLengthFor
     , objectIdPath
     , objectIdToHex
+    , zeroObjectIdFor
     ) where
 
 import qualified Crypto.Hash.SHA1 as SHA1
+import qualified Crypto.Hash.SHA256 as SHA256
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
 import Data.Char (digitToInt, isHexDigit, toLower)
 import Data.Word (Word8)
 import Numeric (showHex)
 
+-- | The object formats this implementation understands. Git identifies them
+-- on the wire and in the repository config by these names.
 data HashAlgorithm
     = Sha1
+    | Sha256
     deriving (Eq, Ord, Show)
 
 newtype ObjectId = ObjectId ByteString
     deriving (Eq, Ord, Show)
 
--- | The raw length of an object id. Git writes SHA-1 ids as 20 bytes.
+-- | The raw length of a SHA-1 object id. Kept for callers that predate the
+-- multi-format API.
 objectIdLength :: Int
-objectIdLength = 20
+objectIdLength = objectIdLengthFor Sha1
+
+objectIdLengthFor :: HashAlgorithm -> Int
+objectIdLengthFor Sha1 = 20
+objectIdLengthFor Sha256 = 32
+
+hashSize :: HashAlgorithm -> Int
+hashSize = objectIdLengthFor
 
 defaultHashAlgorithm :: HashAlgorithm
 defaultHashAlgorithm = Sha1
 
+hashAlgorithmName :: HashAlgorithm -> ByteString
+hashAlgorithmName Sha1 = BS8.pack "sha1"
+hashAlgorithmName Sha256 = BS8.pack "sha256"
+
+hashAlgorithmFromName :: ByteString -> Maybe HashAlgorithm
+hashAlgorithmFromName name
+    | name == BS8.pack "sha1" = Just Sha1
+    | name == BS8.pack "sha256" = Just Sha256
+    | otherwise = Nothing
+
 hashBytes :: ByteString -> ObjectId
-hashBytes = ObjectId . SHA1.hash
+hashBytes = hashBytesFor Sha1
+
+hashBytesFor :: HashAlgorithm -> ByteString -> ObjectId
+hashBytesFor Sha1 = ObjectId . SHA1.hash
+hashBytesFor Sha256 = ObjectId . SHA256.hash
+
+zeroObjectIdFor :: HashAlgorithm -> ObjectId
+zeroObjectIdFor hashAlgorithm =
+    ObjectId (BS.replicate (hashSize hashAlgorithm) 0)
 
 -- | True for the all-zero id. Upload-pack uses it in the advertisement for an
 -- empty repository.
@@ -42,8 +81,11 @@ isZeroObjectId :: ObjectId -> Bool
 isZeroObjectId (ObjectId rawBytes) = BS.all (== 0) rawBytes
 
 objectIdFromBytes :: ByteString -> Maybe ObjectId
-objectIdFromBytes rawBytes
-    | BS.length rawBytes == objectIdLength = Just (ObjectId rawBytes)
+objectIdFromBytes = objectIdFromBytesFor Sha1
+
+objectIdFromBytesFor :: HashAlgorithm -> ByteString -> Maybe ObjectId
+objectIdFromBytesFor hashAlgorithm rawBytes
+    | BS.length rawBytes == hashSize hashAlgorithm = Just (ObjectId rawBytes)
     | otherwise = Nothing
 
 objectIdBytes :: ObjectId -> ByteString
@@ -61,7 +103,15 @@ objectIdToHex (ObjectId rawBytes) = concatMap renderByte (BS.unpack rawBytes)
 
 objectIdFromHex :: String -> Maybe ObjectId
 objectIdFromHex hexText
-    | length hexText /= objectIdLength * 2 = Nothing
+    | length hexText == objectIdLengthFor Sha1 * 2 =
+        objectIdFromHexFor Sha1 hexText
+    | length hexText == objectIdLengthFor Sha256 * 2 =
+        objectIdFromHexFor Sha256 hexText
+    | otherwise = Nothing
+
+objectIdFromHexFor :: HashAlgorithm -> String -> Maybe ObjectId
+objectIdFromHexFor hashAlgorithm hexText
+    | length hexText /= hashSize hashAlgorithm * 2 = Nothing
     | not (all isHexDigit hexText) = Nothing
     | otherwise = ObjectId . BS.pack <$> traverse parsePair (pairs hexText)
   where

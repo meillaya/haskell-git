@@ -2,6 +2,7 @@ module Git.Object.Tree
     ( TreeEntry
     , TreeEntryMode (..)
     , decodeTree
+    , decodeTreeFor
     , encodeTree
     , renderTreeEntry
     , treeEntry
@@ -10,6 +11,7 @@ module Git.Object.Tree
     , treeEntryObjectId
     , treeEntryTypeName
     , treeFromObject
+    , treeFromObjectFor
     , treeToObject
     ) where
 
@@ -18,7 +20,14 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.Set as Set
 import Data.List (sortOn)
-import Git.Hash (ObjectId, objectIdBytes, objectIdFromBytes, objectIdLength, objectIdToHex)
+import Git.Hash
+    ( HashAlgorithm (..)
+    , ObjectId
+    , objectIdBytes
+    , objectIdFromBytesFor
+    , objectIdLengthFor
+    , objectIdToHex
+    )
 import Git.Object (GitObject, GitObjectType (TreeObject), gitObject, gitObjectPayload, gitObjectType)
 
 -- | The five entry modes a git tree may contain. Git enforces that no other
@@ -62,8 +71,13 @@ encodeTree entries = BS.concat (map encodeEntry (sortOn sortKey entries))
 -- into filesystem paths and a tree that git itself would reject must not reach
 -- the disk.
 decodeTree :: ByteString -> Either String [TreeEntry]
-decodeTree rawTree = go rawTree [] Set.empty
+decodeTree = decodeTreeFor Sha1
+
+decodeTreeFor :: HashAlgorithm -> ByteString -> Either String [TreeEntry]
+decodeTreeFor hashAlgorithm rawTree = go rawTree [] Set.empty
   where
+    objectIdLength = objectIdLengthFor hashAlgorithm
+
     go bytes entries seen
         | BS.null bytes = Right (reverse entries)
         | otherwise = do
@@ -89,7 +103,7 @@ decodeTree rawTree = go rawTree [] Set.empty
                                                 maybe
                                                     (Left "Malformed tree entry: invalid object id bytes")
                                                     Right
-                                                    (objectIdFromBytes rawObjectId)
+                                                    (objectIdFromBytesFor hashAlgorithm rawObjectId)
                                             go
                                                 (BS.drop objectIdLength remaining)
                                                 (treeEntry mode nameBytes objectId : entries)
@@ -106,9 +120,12 @@ treeToObject :: [TreeEntry] -> GitObject
 treeToObject = gitObject TreeObject . encodeTree
 
 treeFromObject :: GitObject -> Either String [TreeEntry]
-treeFromObject currentObject =
+treeFromObject = treeFromObjectFor Sha1
+
+treeFromObjectFor :: HashAlgorithm -> GitObject -> Either String [TreeEntry]
+treeFromObjectFor hashAlgorithm currentObject =
     if gitObjectType currentObject == TreeObject
-        then decodeTree (gitObjectPayload currentObject)
+        then decodeTreeFor hashAlgorithm (gitObjectPayload currentObject)
         else Left "Expected a tree object"
 
 -- | The type name git prints for an entry, which follows the mode rather than

@@ -7,10 +7,10 @@ module Git.Verify
 import Control.Exception (IOException, try)
 import Control.Monad (forM)
 import Git.Hash (ObjectId, objectIdToHex)
-import Git.Object.Loose (listLooseObjectIds, objectIdForObject, readLooseObject)
+import Git.Object.Loose (listLooseObjectIds, objectIdForObjectFor, readLooseObject)
 import Git.Pack.Index (packIndexObjectIds)
 import Git.Refs (listRefs, resolveHeadReference)
-import Git.Repo (Repository)
+import Git.Repo (Repository, repositoryObjectFormat)
 import Git.Store
     ( PackFile (..)
     , Store
@@ -61,7 +61,7 @@ verifyLooseObject repository objectId = do
     case attempt of
         Left err -> pure [describe objectId err]
         Right gitObjectValue ->
-            if objectIdForObject gitObjectValue == objectId
+            if objectIdForObjectFor (repositoryObjectFormat repository) gitObjectValue == objectId
                 then pure []
                 else pure [objectIdToHex objectId ++ ": content does not hash to its file name"]
 

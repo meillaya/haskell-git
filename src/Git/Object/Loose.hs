@@ -6,6 +6,7 @@ module Git.Object.Loose
     , looseObjectPath
     , looseObjectType
     , objectIdForObject
+    , objectIdForObjectFor
     , readLooseObject
     , writeLooseObject
     ) where
@@ -33,9 +34,19 @@ import System.Directory
     )
 import System.FilePath ((</>), takeDirectory, takeFileName)
 import System.IO (hClose, openTempFile)
-import Git.Hash (ObjectId, hashBytes, objectIdFromBytes, objectIdFromHex, objectIdPath, objectIdToHex)
+import Git.Hash
+    ( HashAlgorithm
+    , ObjectId
+    , hashBytes
+    , hashBytesFor
+    , objectIdBytes
+    , objectIdFromHexFor
+    , objectIdLengthFor
+    , objectIdPath
+    , objectIdToHex
+    )
 import Git.Object (GitObject, GitObjectType, decodeGitObject, encodeGitObject)
-import Git.Repo (Repository, repositoryObjectsDir)
+import Git.Repo (Repository (..), repositoryObjectsDir)
 
 data LooseObject = LooseObject
     { looseObjectId :: ObjectId
@@ -49,13 +60,16 @@ looseObject = LooseObject
 objectIdForObject :: GitObject -> ObjectId
 objectIdForObject = hashBytes . encodeGitObject
 
+objectIdForObjectFor :: HashAlgorithm -> GitObject -> ObjectId
+objectIdForObjectFor hashAlgorithm = hashBytesFor hashAlgorithm . encodeGitObject
+
 -- | Write one object as a zlib-compressed loose file. The write goes through a
 -- temporary file and a rename so an interrupted process cannot leave a
 -- truncated object under a valid id, and an existing object is left alone.
 writeLooseObject :: Repository -> GitObject -> IO ObjectId
 writeLooseObject repository currentObject = do
     let encodedObject = encodeGitObject currentObject
-        objectId = hashBytes encodedObject
+        objectId = objectIdForObjectFor (repositoryObjectFormat repository) currentObject
         objectPath = looseObjectPath repository objectId
         objectDirectory = takeDirectory objectPath
     createDirectoryIfMissing True objectDirectory
@@ -74,31 +88,43 @@ writeLooseObject repository currentObject = do
 
 readLooseObject :: Repository -> ObjectId -> IO GitObject
 readLooseObject repository objectId = do
-    let objectPath = looseObjectPath repository objectId
-    objectExists <- doesFileExist objectPath
-    if not objectExists
-        then ioError (userError ("Object not found: " ++ objectIdToHex objectId))
+    let objectFormat = repositoryObjectFormat repository
+        expectedLength = objectIdLengthFor objectFormat
+    if BS.length (objectIdBytes objectId) /= expectedLength
+        then
+            ioError
+                ( userError
+                    ( "object id length does not match the repository object format: "
+                        ++ objectIdToHex objectId
+                    )
+                )
         else do
-            compressedObject <- BL.readFile objectPath
-            decompressedResult <-
-                try
-                    (evaluate (BL.toStrict (Zlib.decompress compressedObject))) ::
-                    IO (Either SomeException ByteString)
-            case decompressedResult of
-                Left decompressionError ->
-                    ioError
-                        (userError
-                            ("Failed to decompress loose object: " ++ displayException decompressionError))
-                Right rawObject ->
-                    case decodeGitObject rawObject of
-                        Left err -> ioError (userError err)
-                        Right gitObjectValue -> pure gitObjectValue
+            let objectPath = looseObjectPath repository objectId
+            objectExists <- doesFileExist objectPath
+            if not objectExists
+                then ioError (userError ("Object not found: " ++ objectIdToHex objectId))
+                else do
+                    compressedObject <- BL.readFile objectPath
+                    decompressedResult <-
+                        try
+                            (evaluate (BL.toStrict (Zlib.decompress compressedObject))) ::
+                            IO (Either SomeException ByteString)
+                    case decompressedResult of
+                        Left decompressionError ->
+                            ioError
+                                (userError
+                                    ("Failed to decompress loose object: " ++ displayException decompressionError))
+                        Right rawObject ->
+                            case decodeGitObject rawObject of
+                                Left err -> ioError (userError err)
+                                Right gitObjectValue -> pure gitObjectValue
 
 -- | Every object id that has a loose file in the repository. Directories that
 -- git reserves (@info@, @pack@) are skipped.
 listLooseObjectIds :: Repository -> IO [ObjectId]
 listLooseObjectIds repository = do
-    let objectsDirectory = repositoryObjectsDir repository
+    let objectFormat = repositoryObjectFormat repository
+        objectsDirectory = repositoryObjectsDir repository
     objectsDirectoryExists <- doesDirectoryExist objectsDirectory
     if not objectsDirectoryExists
         then pure []
@@ -114,7 +140,7 @@ listLooseObjectIds repository = do
                             names <- listDirectory prefixDirectory
                             pure
                                 ( catMaybes
-                                    [ objectIdFromHex (prefix ++ name)
+                                    [ objectIdFromHexFor objectFormat (prefix ++ name)
                                     | name <- names
                                     ]
                                 )

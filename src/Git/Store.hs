@@ -28,7 +28,7 @@ import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import System.FilePath ((</>))
-import Git.Hash (ObjectId, hashBytes, objectIdBytes, objectIdLength, objectIdToHex)
+import Git.Hash (ObjectId, objectIdToHex)
 import Git.Object
     ( GitObject (..)
     , GitObjectType (..)
@@ -36,23 +36,36 @@ import Git.Object
     , gitObjectPayload
     , gitObjectType
     )
-import Git.Object.Commit (Commit, commitFromObject, commitParents)
+import Git.Object.Commit (Commit, commitFromObjectFor, commitParents)
 import Git.Object.Loose
     ( listLooseObjectIds
     , looseObjectPath
-    , objectIdForObject
+    , objectIdForObjectFor
     , readLooseObject
     )
-import Git.Object.Tree (TreeEntry, treeEntryMode, treeEntryName, treeEntryObjectId, treeFromObject, TreeEntryMode (Directory))
-import Git.Pack (PackObjectKind (..), packHeaderObjectCount, parsePackHeader)
+import Git.Object.Tree
+    ( TreeEntry
+    , TreeEntryMode (Directory)
+    , treeEntryMode
+    , treeEntryName
+    , treeEntryObjectId
+    , treeFromObjectFor
+    )
+import Git.Pack (PackObjectKind (..), packHeaderObjectCount)
 import Git.Pack.Delta (applyDelta, parseDelta)
-import Git.Pack.Index (PackIndex, lookupPackIndexOffset, packIndexEntries, packIndexObjectIds, parsePackIndex)
-import Git.Pack.Read (PackRawObject (..), parsePackObjectAt)
+import Git.Pack.Index
+    ( PackIndex
+    , lookupPackIndexOffset
+    , packIndexEntries
+    , packIndexObjectIds
+    , parsePackIndexFor
+    )
+import Git.Pack.Read (PackRawObject (..))
+import Git.Pack.Stream (readPackHeaderFromFile, readPackObjectAtFile, validatePackFile)
 import Git.Repo (Repository (..), repositoryObjectsDir)
 
 data PackFile = PackFile
     { packFilePath :: FilePath
-    , packFileBytes :: ByteString
     , packFileIndex :: PackIndex
     }
 
@@ -65,11 +78,17 @@ data Store = Store
 maximumDeltaDepth :: Int
 maximumDeltaDepth = 128
 
--- | Load the pack files once. Every command that touches an object database
--- holds one of these, so a pack is read from disk at most once per process.
+-- | Keep resolved delta bases bounded. A read command may touch thousands of
+-- objects; retaining every resolved object would grow with the whole pack.
+maximumMemoEntries :: Int
+maximumMemoEntries = 1024
+
+-- | Load the pack indexes. Pack contents stay on disk and are read per object,
+-- so a read command never holds a whole pack in memory.
 loadStore :: Repository -> IO Store
 loadStore repository = do
-    let packDirectory = repositoryObjectsDir repository </> "pack"
+    let objectFormat = repositoryObjectFormat repository
+        packDirectory = repositoryObjectsDir repository </> "pack"
     packDirectoryExists <- doesDirectoryExist packDirectory
     names <- if packDirectoryExists then listDirectory packDirectory else pure []
     packs <-
@@ -81,40 +100,23 @@ loadStore repository = do
                 either
                     (ioError . userError . (("pack index " ++ indexPath ++ ": ") ++))
                     pure
-                    (parsePackIndex indexBytes)
+                    (parsePackIndexFor objectFormat indexBytes)
             packExists <- doesFileExist packPath
             if not packExists
                 then ioError (userError ("missing pack file for " ++ indexPath))
                 else pure ()
-            packBytes <- BS.readFile packPath
-            (header, _) <-
-                either
-                    (ioError . userError . ((packPath ++ ": ") ++))
-                    pure
-                    (parsePackHeader packBytes)
-            validatePackChecksum packPath packBytes
+            header <- readPackHeaderFromFile packPath
+            validatePackFile objectFormat packPath
             if packHeaderObjectCount header /= length (packIndexEntries packIndex)
                 then ioError (userError ("pack index does not match the pack object count: " ++ packPath))
                 else pure ()
             pure
                 PackFile
                     { packFilePath = packPath
-                    , packFileBytes = packBytes
                     , packFileIndex = packIndex
                     }
     memo <- newIORef Map.empty
     pure (Store repository packs memo)
-
-validatePackChecksum :: FilePath -> ByteString -> IO ()
-validatePackChecksum packPath packBytes
-    | BS.length packBytes < objectIdLength =
-        ioError (userError ("pack file is too short: " ++ packPath))
-    | objectIdBytes (hashBytes body) /= trailer =
-        ioError (userError ("pack file checksum mismatch: " ++ packPath))
-    | otherwise = pure ()
-  where
-    body = BS.take (BS.length packBytes - objectIdLength) packBytes
-    trailer = BS.drop (BS.length packBytes - objectIdLength) packBytes
 
 readObject :: Store -> ObjectId -> IO (Maybe GitObject)
 readObject store objectId = do
@@ -152,9 +154,11 @@ listObjectIds store = do
 flattenTree :: Store -> ObjectId -> IO [(FilePath, TreeEntry)]
 flattenTree store rootTreeId = go "" rootTreeId
   where
+    objectFormat = repositoryObjectFormat (storeRepository store)
+
     go prefix treeId = do
         treeObject <- readObjectOrFail store treeId
-        entries <- either (ioError . userError) pure (treeFromObject treeObject)
+        entries <- either (ioError . userError) pure (treeFromObjectFor objectFormat treeObject)
         fmap concat $
             forM entries $ \entry -> do
                 let name = BS8.unpack (treeEntryName entry)
@@ -169,12 +173,15 @@ flattenTree store rootTreeId = go "" rootTreeId
 walkCommits :: Store -> ObjectId -> IO [(ObjectId, Commit)]
 walkCommits store startCommitId = go Set.empty [startCommitId] []
   where
+    objectFormat = repositoryObjectFormat (storeRepository store)
+
     go _ [] commits = pure (reverse commits)
     go seen (objectId:rest) commits
         | Set.member objectId seen = go seen rest commits
         | otherwise = do
             gitObjectValue <- readObjectOrFail store objectId
-            currentCommit <- either (ioError . userError) pure (commitFromObject gitObjectValue)
+            currentCommit <-
+                either (ioError . userError) pure (commitFromObjectFor objectFormat gitObjectValue)
             go
                 (Set.insert objectId seen)
                 (commitParents currentCommit ++ rest)
@@ -200,6 +207,8 @@ readLooseIfPresent store objectId = do
 readFromPacks :: Store -> Int -> ObjectId -> IO (Either String GitObject)
 readFromPacks store depth objectId = go (storePacks store)
   where
+    objectFormat = repositoryObjectFormat (storeRepository store)
+
     go [] = pure (Left ("object not found: " ++ objectIdToHex objectId))
     go (pack:rest) =
         case lookupPackIndexOffset (packFileIndex pack) objectId of
@@ -209,7 +218,7 @@ readFromPacks store depth objectId = go (storePacks store)
                 case result of
                     Left err -> pure (Left err)
                     Right gitObjectValue ->
-                        if objectIdForObject gitObjectValue /= objectId
+                        if objectIdForObjectFor objectFormat gitObjectValue /= objectId
                             then
                                 pure
                                     ( Left
@@ -221,12 +230,14 @@ readFromPacks store depth objectId = go (storePacks store)
 
 readObjectAtOffset :: Store -> Int -> PackFile -> Int -> IO (Either String GitObject)
 readObjectAtOffset store depth pack offset = do
-    let memoKey = (packFilePath pack, offset)
+    let objectFormat = repositoryObjectFormat (storeRepository store)
+        memoKey = (packFilePath pack, offset)
     cached <- Map.lookup memoKey <$> readIORef (storeMemo store)
     case cached of
         Just gitObjectValue -> pure (Right gitObjectValue)
-        Nothing ->
-            case parsePackObjectAt (packFileBytes pack) offset of
+        Nothing -> do
+            result <- readPackObjectAtFile objectFormat (packFilePath pack) offset
+            case result of
                 Left err -> pure (Left err)
                 Right (rawObject, _) ->
                     case rawObject of
@@ -248,8 +259,15 @@ readObjectAtOffset store depth pack offset = do
         case result of
             Left err -> pure (Left err)
             Right gitObjectValue -> do
-                modifyIORef' (storeMemo store) (Map.insert memoKey gitObjectValue)
+                modifyIORef' (storeMemo store) (insertBounded memoKey gitObjectValue)
                 pure (Right gitObjectValue)
+
+    insertBounded memoKey gitObjectValue currentMemo =
+        let capped =
+                if Map.size currentMemo >= maximumMemoEntries
+                    then Map.deleteMin currentMemo
+                    else currentMemo
+         in Map.insert memoKey gitObjectValue capped
 
 toGitObject :: PackObjectKind -> ByteString -> Either String GitObject
 toGitObject objectKind payload =

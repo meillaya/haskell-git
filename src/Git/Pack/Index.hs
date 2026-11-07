@@ -5,6 +5,7 @@ module Git.Pack.Index
     , packIndexEntries
     , packIndexObjectIds
     , parsePackIndex
+    , parsePackIndexFor
     ) where
 
 import Data.Bits ((.&.), (.|.), shiftL)
@@ -13,11 +14,12 @@ import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Word (Word32, Word64)
 import Git.Hash
-    ( ObjectId
-    , hashBytes
+    ( HashAlgorithm (..)
+    , ObjectId
+    , hashBytesFor
+    , hashSize
     , objectIdBytes
-    , objectIdFromBytes
-    , objectIdLength
+    , objectIdFromBytesFor
     )
 
 data PackIndexEntry = PackIndexEntry
@@ -42,7 +44,13 @@ lookupPackIndexOffset packIndex objectId =
 -- | Parse a version 2 pack index. Both trailer checksums are verified, so a
 -- truncated or edited index cannot silently misdirect object lookups.
 parsePackIndex :: ByteString -> Either String PackIndex
-parsePackIndex bytes = do
+parsePackIndex = parsePackIndexFor Sha1
+
+parsePackIndexFor :: HashAlgorithm -> ByteString -> Either String PackIndex
+parsePackIndexFor hashAlgorithm bytes = do
+    let hashLength = hashSize hashAlgorithm
+        checksumPairLength = hashLength * 2
+        minimumLength = fanoutOffset + fanoutEntryCount * 4 + checksumPairLength
     if BS.length bytes < minimumLength
         then Left "malformed pack index: file is too short"
         else pure ()
@@ -57,7 +65,7 @@ parsePackIndex bytes = do
             fromIntegral
                 (decodeWord32 (BS.take 4 (BS.drop (fanoutOffset + (fanoutEntryCount - 1) * 4) bytes)))
         objectIdStart = fanoutOffset + fanoutEntryCount * 4
-        crcStart = objectIdStart + count * objectIdLength
+        crcStart = objectIdStart + count * hashLength
         offsetStart = crcStart + count * 4
         largeOffsetStart = offsetStart + count * 4
     if version /= supportedVersion
@@ -73,23 +81,23 @@ parsePackIndex bytes = do
             ]
         largeOffsetCount = length (filter isLargeOffset rawOffsets)
         trailerStart = largeOffsetStart + largeOffsetCount * 8
-        contentLength = trailerStart + objectIdLength
+        contentLength = trailerStart + hashLength
     if BS.length bytes < trailerStart + checksumPairLength
         then Left "malformed pack index: truncated large-offset table"
         else pure ()
-    if objectIdBytes (hashBytes (BS.take contentLength bytes)) /= BS.drop contentLength bytes
+    if objectIdBytes (hashBytesFor hashAlgorithm (BS.take contentLength bytes)) /= BS.drop contentLength bytes
         then Left "malformed pack index: checksum mismatch"
         else pure ()
 
     let buildEntry index = do
             let rawOffset = rawOffsets !! index
-                objectIdPosition = objectIdStart + index * objectIdLength
+                objectIdPosition = objectIdStart + index * hashLength
                 crcPosition = crcStart + index * 4
             objectId <-
                 maybe
                     (Left "malformed pack index: invalid object id")
                     Right
-                    (objectIdFromBytes (BS.take objectIdLength (BS.drop objectIdPosition bytes)))
+                    (objectIdFromBytesFor hashAlgorithm (BS.take hashLength (BS.drop objectIdPosition bytes)))
             offset <- resolveOffset bytes largeOffsetCount largeOffsetStart rawOffset
             Right
                 PackIndexEntry
@@ -144,9 +152,3 @@ supportedVersion = 2
 
 largeOffsetFlag :: Word32
 largeOffsetFlag = 0x80000000
-
-minimumLength :: Int
-minimumLength = fanoutOffset + fanoutEntryCount * 4 + checksumPairLength
-
-checksumPairLength :: Int
-checksumPairLength = objectIdLength * 2

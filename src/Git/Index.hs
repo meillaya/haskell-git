@@ -3,9 +3,11 @@ module Git.Index
     , buildTreeFromIndex
     , indexEntryFromTree
     , parseIndex
+    , parseIndexFor
     , sortIndexEntries
     , upsertIndexEntry
     , writeIndex
+    , writeIndexFor
     ) where
 
 import Control.Monad (forM)
@@ -16,7 +18,14 @@ import qualified Data.ByteString.Char8 as BS8
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word16, Word32)
-import Git.Hash (ObjectId, hashBytes, objectIdBytes, objectIdFromBytes, objectIdLength)
+import Git.Hash
+    ( HashAlgorithm (..)
+    , ObjectId
+    , hashBytesFor
+    , hashSize
+    , objectIdBytes
+    , objectIdFromBytesFor
+    )
 import Git.Object.Loose (writeLooseObject)
 import Git.Object.Tree (TreeEntry (..), TreeEntryMode (..), treeEntry, treeToObject)
 import Git.Repo (Repository)
@@ -29,6 +38,7 @@ data IndexEntry = IndexEntry
     , indexEntryMode :: TreeEntryMode
     , indexEntrySize :: Word32
     , indexEntryObjectId :: ObjectId
+    , indexEntryStage :: Word16
     }
     deriving (Eq, Show)
 
@@ -39,32 +49,46 @@ indexEntryFromTree path entry size =
         , indexEntryMode = treeEntryMode entry
         , indexEntrySize = size
         , indexEntryObjectId = treeEntryObjectId entry
+        , indexEntryStage = 0
         }
 
 sortIndexEntries :: [IndexEntry] -> [IndexEntry]
-sortIndexEntries = sortOn indexEntryPath
+sortIndexEntries = sortOn (\entry -> (indexEntryPath entry, indexEntryStage entry))
 
 -- | Replace an entry with the same path, or insert it, then keep the list in
 -- path order so the serialised index is stable.
 upsertIndexEntry :: IndexEntry -> [IndexEntry] -> [IndexEntry]
-upsertIndexEntry entry entries = sortIndexEntries (entry : filter ((/= indexEntryPath entry) . indexEntryPath) entries)
+upsertIndexEntry entry entries =
+    sortIndexEntries
+        ( entry
+            : filter
+                (\existing ->
+                    indexEntryPath existing /= indexEntryPath entry
+                        || indexEntryStage existing /= indexEntryStage entry)
+                entries
+        )
 
--- | Serialise the index in version 2. Each entry is a 62-byte fixed header,
--- the path, one to eight NUL bytes of padding, and the whole file ends with a
--- SHA-1. The padding rule is measured from the start of the entry, not from
--- the start of the file.
+-- | Serialise the index in version 2. Each entry is a fixed header whose size
+-- depends on the object format, the path, one to eight NUL bytes of padding,
+-- and the whole file ends with a hash. The padding rule is measured from the
+-- start of the entry, not from the start of the file.
 writeIndex :: [IndexEntry] -> ByteString
-writeIndex entries =
+writeIndex = writeIndexFor Sha1
+
+writeIndexFor :: HashAlgorithm -> [IndexEntry] -> ByteString
+writeIndexFor hashAlgorithm entries =
     let sorted = sortIndexEntries entries
         header = BS8.pack "DIRC" <> encodeWord32 2 <> encodeWord32 (fromIntegral (length sorted))
         body = BS.concat (map encodeEntry sorted)
         content = header <> body
-     in content <> objectIdBytes (hashBytes content)
+     in content <> objectIdBytes (hashBytesFor hashAlgorithm content)
 
 encodeEntry :: IndexEntry -> ByteString
 encodeEntry entry =
     let pathBytes = indexEntryPath entry
-        flags = fromIntegral (min (BS.length pathBytes) maximumInlinePathLength) :: Word16
+        flags =
+            fromIntegral (min (BS.length pathBytes) maximumInlinePathLength)
+                .|. (indexEntryStage entry `shiftL` 12)
         withoutPath =
             BS.concat
                 [ encodeWord32 0 -- ctime seconds
@@ -85,11 +109,14 @@ encodeEntry entry =
         padding = (alignment - (BS.length withoutPath `mod` alignment)) `mod` alignment
      in withoutPath <> BS.replicate padding 0
 
--- | Parse a version 2 index. Extensions are skipped and the trailing SHA-1 is
+-- | Parse a version 2 index. Extensions are skipped and the trailing hash is
 -- verified. Versions 3 and 4 are refused by name.
 parseIndex :: ByteString -> Either String [IndexEntry]
-parseIndex bytes = do
-    if BS.length bytes < minimumIndexLength
+parseIndex = parseIndexFor Sha1
+
+parseIndexFor :: HashAlgorithm -> ByteString -> Either String [IndexEntry]
+parseIndexFor hashAlgorithm bytes = do
+    if BS.length bytes < indexHeaderLength + hashLength
         then Left "malformed index: file is too short"
         else pure ()
     if BS.take 4 bytes /= indexSignature
@@ -100,20 +127,23 @@ parseIndex bytes = do
     if version /= supportedIndexVersion
         then Left ("unsupported index version: " ++ show version)
         else pure ()
-    let contentLength = BS.length bytes - objectIdLength
+    let contentLength = BS.length bytes - hashLength
         expectedChecksum = BS.drop contentLength bytes
-        actualChecksum = objectIdBytes (hashBytes (BS.take contentLength bytes))
+        actualChecksum = objectIdBytes (hashBytesFor hashAlgorithm (BS.take contentLength bytes))
     if expectedChecksum /= actualChecksum
         then Left "malformed index: checksum mismatch"
         else pure ()
     entries <- parseEntries headerLength count
     Right entries
   where
+    hashLength = hashSize hashAlgorithm
+    flagsOffset = objectIdOffset + hashLength
+    fixedEntryLength = flagsOffset + 2
     headerLength = indexHeaderLength
 
     parseEntries _ 0 = Right []
     parseEntries position remaining
-        | position + fixedEntryLength > BS.length bytes - objectIdLength =
+        | position + fixedEntryLength > BS.length bytes - hashLength =
             Left "malformed index: truncated entry"
         | otherwise = do
             let modePosition = position + modeOffset
@@ -123,16 +153,17 @@ parseIndex bytes = do
                 pathStart = position + fixedEntryLength
                 rawFlags = decodeWord16 (BS.take 2 (BS.drop flagsPosition bytes))
                 declaredPathLength = fromIntegral (rawFlags .&. 0x0fff)
+                stage = (rawFlags `shiftR` 12) .&. 0x3
             objectId <-
                 maybe
                     (Left "malformed index: invalid object id")
                     Right
-                    (objectIdFromBytes (BS.take objectIdLength (BS.drop objectIdPosition bytes)))
+                    (objectIdFromBytesFor hashAlgorithm (BS.take hashLength (BS.drop objectIdPosition bytes)))
             pathLength <-
                 resolvePathLength pathStart declaredPathLength
             let entryLength = alignedEntryLength pathLength
                 nextPosition = position + entryLength
-            if nextPosition > BS.length bytes - objectIdLength
+            if nextPosition > BS.length bytes - hashLength
                 then Left "malformed index: entry padding runs past the file"
                 else pure ()
             let pathBytes = BS.take pathLength (BS.drop pathStart bytes)
@@ -144,6 +175,7 @@ parseIndex bytes = do
                         , indexEntryMode = mode
                         , indexEntrySize = size
                         , indexEntryObjectId = objectId
+                        , indexEntryStage = stage
                         }
             (entry :) <$> parseEntries nextPosition (remaining - 1)
 
@@ -153,6 +185,9 @@ parseIndex bytes = do
             case BS.elemIndex 0 (BS.drop pathStart bytes) of
                 Just terminator -> Right terminator
                 Nothing -> Left "malformed index: unterminated long path"
+
+    alignedEntryLength pathLength =
+        ((fixedEntryLength + pathLength + alignment) `div` alignment) * alignment
 
 decodeModeWord :: Word32 -> Either String TreeEntryMode
 decodeModeWord modeWord
@@ -196,10 +231,6 @@ decodeWord32 = BS.foldl' (\accumulator word -> (accumulator `shiftL` 8) .|. from
 alignment :: Int
 alignment = 8
 
-alignedEntryLength :: Int -> Int
-alignedEntryLength pathLength =
-    ((fixedEntryLength + pathLength + alignment) `div` alignment) * alignment
-
 indexSignature :: ByteString
 indexSignature = BS8.pack "DIRC"
 
@@ -208,9 +239,6 @@ indexHeaderLength = 12
 
 supportedIndexVersion :: Word32
 supportedIndexVersion = 2
-
-fixedEntryLength :: Int
-fixedEntryLength = 62
 
 modeOffset :: Int
 modeOffset = 24
@@ -221,14 +249,8 @@ sizeOffset = 36
 objectIdOffset :: Int
 objectIdOffset = 40
 
-flagsOffset :: Int
-flagsOffset = 60
-
 maximumInlinePathLength :: Int
 maximumInlinePathLength = 0x0fff
-
-minimumIndexLength :: Int
-minimumIndexLength = indexHeaderLength + objectIdLength
 
 -- | Build the tree objects that the index describes and return the root tree
 -- id. Directories are formed from the path components; a path that is both a

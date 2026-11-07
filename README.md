@@ -1,9 +1,10 @@
 # haskell-git
 
-haskell-git clones Git repositories over Smart HTTP, then reads, writes, and
-checks them. It implements the formats itself, so it does not need a C Git
-library and does not call `git` for repository work. Use it to inspect a
-repository from code you can read, or to check that an object store is intact.
+haskell-git clones, fetches, pushes, and works with Git repositories over
+Smart HTTP, SSH, and git://, then reads, writes, and checks them. It implements
+the formats itself, so it does not need a C Git library and does not call `git`
+for repository work. Use it to inspect a repository from code you can read, or
+to check that an object store is intact.
 
 The first command:
 
@@ -72,15 +73,16 @@ An empty remote clones too. The result is an empty repository with the remote
 config and the advertised default branch, which is what `git clone` leaves
 behind.
 
-A server that advertises SHA-256 object ids is refused by name, and a remote
-that is not an HTTP or HTTPS URL is refused before any request. HTTP
-authentication is not implemented: a server that demands it fails with its
-HTTP status.
+SHA-1 and SHA-256 repositories are supported. A server that advertises any
+other object format is refused by name. A remote URL may be HTTP(S), SSH
+(`ssh://` or the scp-like `user@host:path` form), or git://. HTTP Basic and
+Bearer authentication work through URL credentials, `GIT_ASKPASS`, or a
+credential helper; SSH authentication is delegated to OpenSSH.
 
 ## Inspect
 
 Read commands take a revision: `HEAD`, a branch or tag name, a full ref, or a
-40-character object id.
+full object id (40 hex digits for SHA-1, 64 for SHA-256).
 
 ```console
 $ haskell-git ls-tree -r HEAD | head -4
@@ -152,6 +154,10 @@ $ git status --porcelain
 $ git fsck --strict
 ```
 
+`init` creates a SHA-1 repository by default. Pass
+`--object-format=sha256` to create a SHA-256 repository; a clone always adopts
+the remote's format.
+
 The tree id depends only on the file contents, so that value is reproducible.
 A commit id also covers the author and committer timestamps, so it changes from
 run to run.
@@ -160,12 +166,44 @@ run to run.
 `GIT_COMMITTER_*` when set, and from the repository `user.name` and `user.email`
 otherwise. It prints the new commit id and leaves HEAD alone, like git.
 
+## Fetch, push, and pull
+
+```console
+$ haskell-git fetch origin
+$ haskell-git push origin main:main
+$ haskell-git pull origin
+```
+
+`fetch` writes `FETCH_HEAD` and the remote-tracking refs, and `push` sends the
+objects reachable from the new tips that the remote does not already have.
+Push requires a fast-forward unless `--force` is used, and `--delete` removes
+a ref. `pull` is fetch followed by a merge; `pull --rebase` replays the local
+commits on top of the fetched head instead.
+
+## Branches and history
+
+```console
+$ haskell-git checkout -b feature
+$ haskell-git switch main
+$ haskell-git merge feature
+$ haskell-git rebase main
+$ haskell-git status
+$ haskell-git reset --hard HEAD~1
+```
+
+`merge` fast-forwards when possible, otherwise performs a three-way merge of
+the trees. Conflicts are written with index stages 1-3 and conflict markers;
+resolve them and run `merge --continue`, or use `merge --abort`. `rebase`
+replays the current branch's commits, preserving author identity and stopping
+on a conflict so that `rebase --continue`, `--skip`, or `--abort` can be used.
+A `checkout` refuses to overwrite local changes.
+
 ## How it works
 
 Git stores four kinds of object. A blob holds file bytes, a tree holds names and
 object ids, a commit points at a tree and its parents, and a tag points at
-another object. An object id is the SHA-1 of the object header and payload, so
-the name of an object is derived from its bytes.
+another object. An object id is the SHA-1 or SHA-256 hash of the object header
+and payload, so the name of an object is derived from its bytes.
 
 ![Object graph](docs/figures/object-model.png)
 
@@ -173,51 +211,74 @@ A reference is a file that contains an object id, or a symbolic reference to
 another reference. `HEAD` points at a branch in a normal checkout and directly
 at a commit in a detached one. Tags and branches live under `refs/`.
 
-The four files the tool reads and writes have fixed layouts. The figure below
-shows the loose object, the tree entry, the index entry, and the pack object
-header. The formulas are the rules this implementation follows: the loose
-object id is the SHA-1 of the encoded object, a tree sorts directories as their
-name plus a slash, an index entry is padded to an eight-byte boundary, and an
-offset delta base is found by subtracting the decoded distance from the entry's
-own offset.
+The four files the tool reads and writes have hash-parameterised layouts. The
+figure below shows the loose object, the tree entry, the index entry, and the
+pack object header. The formulas are the rules this implementation follows:
+the loose object id is the repository hash of the encoded object, a tree sorts
+directories as their name plus a slash, an index entry header is 62 bytes for
+SHA-1 and 74 bytes for SHA-256 and is padded to an eight-byte boundary, and an
+offset delta base is found by subtracting the decoded distance from the
+entry's own offset.
 
 ![File formats](docs/figures/formats.png)
 
-The clone pipeline turns an advertisement and a pack stream into a repository.
-A pkt-line frame is four hex digits of length and the payload, `want` lines name
-the object ids the client needs, and the server answers with a pack. The pack
-reader resolves full objects and both delta kinds, then writes loose objects,
-refs, the index, and the working tree.
+The clone pipeline turns an advertisement and a pack stream into a repository
+over HTTP(S), SSH, or git://. A pkt-line frame is four hex digits of length and
+the payload, `want` lines name the object ids the client needs, and the server
+answers with a streamed pack. The pack is spooled to a temporary file,
+checksummed, and imported incrementally; resolved objects become loose objects,
+then refs, the index, and the working tree.
 
 ![Clone flow](docs/figures/clone-flow.png)
 
-Every command goes through one store. `clone` writes through it, `cat-file`,
-`ls-tree`, and `log` read through it, `verify` walks it, and the write commands
-build objects and hand them to it. The store keeps the loose object directory
-and every pack index open for the life of one command.
+Network commands share one transport layer, and local commands share one store.
+`clone`, `fetch`, and `push` speak through `Transport`; `cat-file`, `ls-tree`,
+`log`, and `verify` read through `Store`; checkout, merge, and rebase update
+the worktree and index from the same store. Pack indexes are loaded once per
+command and packed objects are read through file handles on demand.
 
 ![Module layout](docs/figures/modules.png)
 
-The index is written in version 2. Each entry is a 62-byte header, the path, and
-padding to the next eight-byte boundary, and the file ends with a SHA-1. The
-stat fields are left as zero: git treats a zero size as "hash the file and
-compare", so a fresh checkout is clean and git fills the stat fields in on the
-next status.
+The index is written in version 2. Each entry has a fixed header whose size
+follows the object format, the path, and padding to the next eight-byte
+boundary, and the file ends with the repository hash. The stat fields are left
+as zero: git treats a zero size as "hash the file and compare", so a fresh
+checkout is clean and git fills the stat fields in on the next status.
 
-Pack reads load each pack file once per command and keep resolved deltas in a
-memo table. Large packs cost memory in proportion to their size, which is the
-main reason `clone` and `verify` are aimed at small and medium repositories.
+Pack files are read through file handles and streamed into the importer; a
+clone or fetch spools the response to a temporary pack file and never keeps
+the whole pack in memory. Resolved delta bases are cached in a bounded memo
+table. A single object must still fit in memory while it is read or checked
+out, and pack index tables are loaded in full.
 
 ## Limits
 
-- Smart HTTP only. SSH and the git protocol are not implemented, and there is
-  no authentication.
-- SHA-1 only. A server that advertises `object-format=sha256` is refused.
-- `clone`, `verify`, and the read commands load whole pack files into memory.
-- Submodule entries become empty directories and are not initialised.
-- `push`, `fetch`, `pull`, `merge`, `rebase`, and a general `checkout` are out
-  of scope.
-- Windows is untested. Symlinks and executable bits assume a POSIX filesystem.
+- Smart HTTP, SSH, and git:// are supported. SSH is implemented by invoking
+  OpenSSH, as git itself does; there is no in-process SSH stack. HTTP
+  Digest/NTLM authentication is not supported.
+- SHA-1 and SHA-256 are supported. Object formats cannot be converted, and a
+  dual-hash `compatObjectFormat` repository is refused.
+- Pack files are streamed, but a single object is held in memory while it is
+  read. Pack index tables are loaded in full.
+- Submodules are initialised with `clone --recurse-submodules` and
+  `submodule update --init [--recursive]`; `submodule add`, `deinit`,
+  `foreach`, and `absorbgitdirs` are not implemented. A normal clone still
+  leaves empty submodule directories, matching git.
+- `fetch`, `push`, `pull`, `merge`, `rebase`, `checkout`, `switch`, `branch`,
+  `status`, and `reset --hard` are implemented. Interactive rebase, octopus
+  merges, rename-aware merges, reflogs, hooks, signed-commit verification,
+  shallow/partial clone, LFS, and Windows remain out of scope. Convenience
+  flags such as `merge --no-ff`, `rebase --onto`, and `push --set-upstream` are
+  also not implemented.
+- Merge resolves changes at file granularity. If both sides modify the same
+  file, it reports a conflict rather than attempting a line-level diff3. It
+  does not detect renames.
+- Fetch asks for the needed tips and receives a full pack; it does not yet send
+  `have` lines for a compact negotiation.
+- Push works over Smart HTTP and SSH. `git://` receive-pack is not enabled
+  (the git daemon normally disables it).
+- `status` does not evaluate `.gitignore`; untracked files are reported without
+  ignore filtering. `submodule sync` is not implemented.
 
 ## Tests
 
@@ -225,12 +286,14 @@ main reason `clone` and `verify` are aimed at small and medium repositories.
 $ cabal test
 ```
 
-The suite uses git as the reference. Interoperability tests read and write the
-same repository from both sides, and the clone tests start a real
-`git http-backend` server, clone from it, and then check the result with
-`git status`, `git fsck --strict`, and `git ls-tree`. Unit tests cover the
-codecs, the pack and delta readers, the index, the refs, and the verify
-commands, including corrupted objects.
+The suite uses git as the reference. Integration tests start real
+`git http-backend` servers (including an authenticated one) and a real
+`git daemon`, exercise a fake `GIT_SSH_COMMAND`, and check results with
+`git status`, `git fsck --strict`, `git ls-tree`, and `git submodule status`.
+Unit tests cover the codecs, the streaming pack reader, delta resolution,
+index stages, fetch/push protocols, merge and rebase, and corrupted objects.
 
 `devenv shell -- unit-test` runs the same suite from the shell, and
-`devenv shell -- check` adds `cabal check`.
+`devenv shell -- check` adds `cabal check`. `scripts/memory-benchmark.sh`
+builds a large packed repository and checks the peak memory of `clone` and
+`verify`.

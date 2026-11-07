@@ -269,8 +269,9 @@ def figure_object_model(out_dir):
     s.arrow(1040, 590, 1180, 620, "entry", label_x=1072, label_y=558)
 
     # object ids name the bytes
-    s.box(400, 700, 820, 150, "neutral",
-          "oid = SHA1(type ‖ size ‖ 0x00 ‖ payload)\nref → oid")
+    s.box(400, 690, 820, 170, "neutral",
+          "oid = H(type ‖ size ‖ 0x00 ‖ payload)\n"
+          "H = SHA-1 (20 B) or SHA-256 (32 B)\nref → oid")
     return s.save(out_dir)
 
 
@@ -280,25 +281,27 @@ def figure_object_model(out_dir):
 
 def figure_formats(out_dir):
     s = Scene("formats")
-    s.title("Four byte layouts define every file the tool reads and writes")
+    s.title("Formats are byte layouts parameterised by the hash")
 
     panels = [
         dict(role="compiler", x=60, y=140, header="Loose object",
              record="type SP size NUL payload",
-             formulas=["oid = SHA1(bytes)"],
+             formulas=["oid = H(bytes)", "H = SHA-1 or SHA-256"],
              caption=".git/objects/xx/yyyy, zlib compressed"),
         dict(role="runtime", x=780, y=140, header="Tree entry",
-             record="mode SP name NUL oid[20]",
-             formulas=['key = name ‖ ("/" if tree)'],
+             record="mode SP name NUL oid[h]",
+             formulas=['key = name ‖ ("/" if tree)',
+                       "h = 20 B (SHA-1) or 32 B (SHA-256)"],
              caption="payload of the tree object"),
         dict(role="analysis", x=60, y=520, header="Index entry",
-             record="62-byte header + name + pad",
-             formulas=["len(entry) = (62 + n + 8) & ~7",
+             record="header[h] + name + pad",
+             formulas=["header = 62 B (SHA-1) or 74 B (SHA-256)",
                        "len(entry) ≡ 0 (mod 8)"],
              caption=".git/index, one entry per path"),
         dict(role="hip", x=780, y=520, header="Pack object",
              record="header MSB ‖ type[3] ‖ size[4]",
-             formulas=["base = offset − decode(bytes)"],
+             formulas=["base = offset − decode(bytes)",
+                       "trailer = H(pack bytes)"],
              caption=".git/objects/pack/*.pack"),
     ]
     for p in panels:
@@ -309,7 +312,7 @@ def figure_formats(out_dir):
         s.box(x + 26, y + 80, w - 52, 84, p["role"], p["record"])
         for i, formula in enumerate(p["formulas"]):
             s.note(formula, x + 26, y + 196 + i * 40, BODY)
-        s.note(p["caption"], x + 26, y + 288, NOTE, MUTED)
+        s.note(p["caption"], x + 26, y + 296, NOTE, MUTED)
     return s.save(out_dir)
 
 
@@ -319,41 +322,45 @@ def figure_formats(out_dir):
 
 def figure_clone_flow(out_dir):
     s = Scene("clone-flow")
-    s.title("One Smart HTTP exchange becomes a repository git accepts")
+    s.title("A transport streams an advertisement and a pack into one store")
 
     s.note("Remote", 60, 112, NOTE, MUTED)
-    s.note("Decode", 580, 112, NOTE, MUTED)
-    s.note("Local", 1100, 112, NOTE, MUTED)
+    s.note("Decode and import", 560, 112, NOTE, MUTED)
+    s.note("Local", 1080, 112, NOTE, MUTED)
 
-    # Remote column.
+    # Remote column: the same exchange over HTTP(S), SSH, or git://.
     s.box(60, 180, 300, 100, "model", "GET info/refs")
     s.box(60, 520, 300, 120, "model", "POST upload-pack")
+    s.note("HTTP(S) | SSH | git://", 60, 664, NOTE, MUTED)
+
     # Decode column.
-    s.box(580, 190, 340, 110, "runtime", "pkt-line decoder")
-    s.box(580, 500, 340, 150, "runtime", "pack reader +\ndelta resolver")
+    s.box(560, 190, 340, 110, "runtime", "pkt-line decoder")
+    s.box(560, 490, 340, 140, "runtime", "spooled pack +\nstreaming importer")
+
     # Local column.
-    s.box(1100, 180, 320, 110, "neutral", "loose objects")
-    s.box(1100, 350, 320, 110, "neutral", "refs + HEAD")
-    s.box(1100, 510, 220, 100, "neutral", "index")
-    s.box(1100, 680, 320, 110, "neutral", "working tree")
+    s.box(1080, 180, 320, 110, "neutral", "loose objects")
+    s.box(1080, 350, 320, 110, "neutral", "refs + HEAD")
+    s.box(1080, 510, 220, 100, "neutral", "index")
+    s.box(1080, 680, 320, 110, "neutral", "working tree")
 
-    # Decode formulas.
-    s.note("len(frame) = 4 + len(payload)", 580, 148)
-    s.note("target = applyDelta(base, Δ)", 580, 670)
-    s.note("SHA1(pack) = trailer", 580, 710)
-    s.note("len(entry) = (62 + n + 8) & ~7", 580, 750)
-    s.note("git status ≡ ∅", 1100, 812, NOTE)
+    # Decode and format notes.
+    s.note("len(frame) = 4 + len(payload)", 560, 148)
+    s.note("H(pack) = trailer", 560, 648)
+    s.note("target = applyDelta(base, Δ)", 560, 684)
+    s.note("header = 62 B (SHA-1) or 74 B (SHA-256)", 560, 720, NOTE)
+    s.note("len(entry) ≡ 0 (mod 8)", 560, 748, NOTE)
+    s.note("git status ≡ ∅", 1080, 812, NOTE)
 
-    # The exchange: advertise, want, done, pack.
-    s.arrow(360, 230, 580, 230, "advertise refs", label_x=430, label_y=195)
-    s.arrow(620, 300, 220, 520, "want oids", label_x=361, label_y=366)
-    s.arrow(700, 300, 360, 620, "done", label_x=480, label_y=420)
-    s.arrow(360, 585, 580, 570, "raw pack", label_x=430, label_y=600)
+    # The exchange: advertise, want, done, streamed pack.
+    s.arrow(360, 230, 560, 230, "advertise refs", label_x=412, label_y=196)
+    s.arrow(600, 300, 220, 520, "want oids", label_x=342, label_y=366)
+    s.arrow(680, 300, 360, 620, "done", label_x=470, label_y=420)
+    s.arrow(360, 585, 560, 555, "streamed pack", label_x=410, label_y=602)
 
     # Import: write objects and refs, then check out the working tree.
-    s.arrow(920, 520, 1100, 250, "write", label_x=958, label_y=355)
-    s.arrow(920, 610, 1100, 430, "write", label_x=958, label_y=480)
-    s.arrow(1380, 460, 1380, 680, "checkout", label_x=1290, label_y=638)
+    s.arrow(900, 540, 1080, 235, "write objects", label_x=944, label_y=360)
+    s.arrow(900, 600, 1080, 405, "write refs", label_x=944, label_y=490)
+    s.arrow(1400, 460, 1400, 680, "checkout", label_x=1290, label_y=638)
     return s.save(out_dir)
 
 
@@ -363,48 +370,43 @@ def figure_clone_flow(out_dir):
 
 def figure_modules(out_dir):
     s = Scene("modules")
-    s.title("Every command goes through one store")
+    s.title("Commands share transport, store, and worktree layers")
 
     s.note("Commands", 60, 104, NOTE, MUTED)
     s.note("Library", 500, 104, NOTE, MUTED)
-    s.note("Disk (one store)", 980, 104, NOTE, MUTED)
+    s.note("Disk (one store)", 1000, 104, NOTE, MUTED)
 
-    rows = [140, 305, 470, 635]
-    box_h = 115
-    commands = ["clone", "inspect commands", "write commands", "verify"]
-    library = ["Clone", "Store", "Index and Refs", "Verify"]
-    for y, label in zip(rows, commands):
-        s.box(60, y, 300, box_h, "model", label)
-    for y, label in zip(rows, library):
-        if label == "Index and Refs":
-            # Narrower, so the Verify to Store arrow can pass on the right.
-            s.box(500, y, 240, box_h, "compiler", label)
-        else:
-            s.box(500, y, 300, box_h, "compiler", label)
+    # Command groups.
+    s.box(60, 150, 320, 120, "model", "clone, fetch,\npush, pull")
+    s.box(60, 330, 320, 120, "model", "checkout, merge,\nrebase, status")
+    s.box(60, 510, 320, 120, "model", "inspect, write,\nverify, submodule")
+
+    # Library layers, ordered so that data flows downward without crossing.
+    s.box(500, 150, 340, 120, "compiler", "Transport")
+    s.box(500, 310, 340, 120, "compiler", "Fetch / Push")
+    s.box(500, 470, 340, 110, "analysis", "Store + object,\nindex, ref codecs")
+    s.box(500, 630, 340, 120, "runtime", "Worktree +\nMerge / Rebase")
+
     # One disk store holding everything the tool reads and writes.
-    s.box(980, 140, 460, 610, "neutral",
-          "loose objects and packs\nrefs and HEAD\nindex\nworking tree")
+    s.box(1000, 150, 440, 600, "neutral",
+          "objects and packs\nrefs and HEAD\nindex\nworking tree")
 
-    # Command -> library module.
-    s.arrow(360, 197, 500, 197, "clone", label_x=392, label_y=165)
-    s.arrow(360, 362, 500, 362, "readObject", label_x=372, label_y=325)
-    s.arrow(360, 527, 500, 527, "writeIndex", label_x=372, label_y=492)
-    s.arrow(360, 692, 500, 692, "verify", label_x=392, label_y=655)
+    # Commands to layers.
+    s.arrow(380, 210, 500, 210, "URLs", label_x=405, label_y=176)
+    s.arrow(380, 390, 500, 690, "trees", label_x=392, label_y=480)
+    s.arrow(380, 570, 500, 525, "readObject", label_x=390, label_y=540)
 
-    # Every module goes through Store.
-    s.arrow(700, 255, 700, 305, "stores", label_x=716, label_y=264)
-    s.arrow(700, 470, 700, 420, "writes", label_x=716, label_y=431)
-    s.arrow(795, 635, 795, 420, "reads", label_x=807, label_y=510)
+    # Layer to layer.
+    s.arrow(670, 270, 670, 310, "pack", label_x=690, label_y=280)
+    s.arrow(670, 430, 670, 470, "write", label_x=690, label_y=440)
+    s.arrow(840, 630, 840, 580, "index", label_x=858, label_y=600)
+    s.arrow(840, 525, 1000, 450, "read/write", label_x=860, label_y=500)
 
-    # Store -> one repository.
-    s.arrow(800, 362, 980, 362, "read/write", label_x=870, label_y=318)
-
-    # Type signatures (body size, as note text).
+    # Type signatures.
     s.note("Type signatures", 60, 768, NOTE, MUTED)
-    s.note("readObject :: Repository → ObjectId → IO GitObject",
-           60, 794)
-    s.note("writeIndex :: [Entry] → ByteString", 60, 828)
-    s.note("verify :: Repository → IO Report", 60, 862)
+    s.note("readObject :: Repository → ObjectId → IO GitObject", 60, 794)
+    s.note("fetch :: Repository → Remote → IO ()", 60, 828)
+    s.note("checkoutTree :: Repository → ObjectId → IO ()", 60, 862)
     return s.save(out_dir)
 
 

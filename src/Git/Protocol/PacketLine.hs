@@ -1,17 +1,19 @@
 module Git.Protocol.PacketLine
-    ( PacketLine
+    ( PacketLine (..)
     , decodePacketLines
     , encodePacketLine
     , flushPacket
     , flushPacketLength
     , packetLine
     , packetLinePayload
+    , readPacketLineFromHandle
     ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import Numeric (readHex, showHex)
+import System.IO (Handle)
 
 data PacketLine
     = DataPacket ByteString
@@ -68,6 +70,32 @@ decodePacketLines rawBytes
 
 specialPacketLimit :: Int
 specialPacketLimit = 3
+
+readPacketLineFromHandle :: Handle -> IO (Either String PacketLine)
+readPacketLineFromHandle handle = do
+    prefix <- hGetExact 4
+    case prefix of
+        Left err -> pure (Left err)
+        Right prefixBytes ->
+            case readHex (BS8.unpack prefixBytes) of
+                [(0, "")] -> pure (Right FlushPacket)
+                [(parsedLength, "")]
+                    | parsedLength <= specialPacketLimit ->
+                        pure (Left "Malformed pkt-line stream: protocol v2 special packet in a v0 stream")
+                    | parsedLength > maximumPacketLength ->
+                        pure (Left "Malformed pkt-line stream: length prefix overflows the maximum")
+                    | otherwise -> do
+                        payload <- hGetExact (parsedLength - 4)
+                        pure (DataPacket <$> payload)
+                _ -> pure (Left "Malformed pkt-line stream: invalid length prefix")
+  where
+    hGetExact count
+        | count <= 0 = pure (Right BS.empty)
+        | otherwise = do
+            bytes <- BS.hGet handle count
+            if BS.length bytes == count
+                then pure (Right bytes)
+                else pure (Left "Malformed pkt-line stream: truncated packet")
 
 maximumPacketLength :: Int
 maximumPacketLength = 65520

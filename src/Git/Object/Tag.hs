@@ -1,8 +1,10 @@
 module Git.Object.Tag
     ( Tag (..)
     , decodeTag
+    , decodeTagFor
     , encodeTag
     , tagFromObject
+    , tagFromObjectFor
     , tagMessage
     , tagName
     , tagObject
@@ -14,7 +16,7 @@ module Git.Object.Tag
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
-import Git.Hash (ObjectId, objectIdFromHex, objectIdToHex)
+import Git.Hash (HashAlgorithm (..), ObjectId, objectIdFromHexFor, objectIdToHex)
 import Git.Object
     ( GitObject
     , GitObjectType (TagObject)
@@ -49,7 +51,10 @@ encodeTag currentTag =
         )
 
 decodeTag :: ByteString -> Either String Tag
-decodeTag rawTag = do
+decodeTag = decodeTagFor Sha1
+
+decodeTagFor :: HashAlgorithm -> ByteString -> Either String Tag
+decodeTagFor hashAlgorithm rawTag = do
     let (headerPart, messagePartWithSeparator) = BS8.breakSubstring (BS8.pack "\n\n") rawTag
     if BS.null messagePartWithSeparator
         then Left "Malformed tag: missing header/message separator"
@@ -73,7 +78,7 @@ decodeTag rawTag = do
         maybe
             (Left "Malformed tag: invalid object id")
             Right
-            (objectIdFromHex (BS8.unpack value))
+            (objectIdFromHexFor hashAlgorithm (BS8.unpack value))
 
     parseTypeLine headerLines = do
         value <- headerValue "type" headerLines
@@ -98,7 +103,10 @@ tagToObject :: Tag -> GitObject
 tagToObject = gitObject TagObject . encodeTag
 
 tagFromObject :: GitObject -> Either String Tag
-tagFromObject currentObject =
+tagFromObject = tagFromObjectFor Sha1
+
+tagFromObjectFor :: HashAlgorithm -> GitObject -> Either String Tag
+tagFromObjectFor hashAlgorithm currentObject =
     if gitObjectType currentObject == TagObject
-        then decodeTag (gitObjectPayload currentObject)
+        then decodeTagFor hashAlgorithm (gitObjectPayload currentObject)
         else Left "Expected a tag object"

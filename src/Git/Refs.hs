@@ -1,6 +1,7 @@
 module Git.Refs
     ( HeadReference (..)
     , currentHeadCommit
+    , deleteRef
     , headRefPath
     , listLooseRefs
     , listRefs
@@ -19,9 +20,9 @@ module Git.Refs
 import Control.Monad (forM)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (mapMaybe)
-import Git.Hash (ObjectId, objectIdFromHex, objectIdToHex)
+import Git.Hash (HashAlgorithm, ObjectId, objectIdFromHexFor, objectIdToHex)
 import Git.Repo
-    ( Repository
+    ( Repository (..)
     , repositoryGitDir
     , repositoryPackedRefsPath
     , repositoryRefsDir
@@ -32,6 +33,7 @@ import System.Directory
     , doesDirectoryExist
     , doesFileExist
     , listDirectory
+    , removeFile
     , renameFile
     )
 import System.FilePath ((</>), takeDirectory, takeFileName)
@@ -66,9 +68,33 @@ readHeadReference repository = do
     case stripPrefix "ref: " (trimTrailingNewline contents) of
         Just refPath -> pure (SymbolicHead refPath)
         Nothing ->
-            case objectIdFromHex (trimTrailingNewline contents) of
+            case objectIdFromHexFor (repositoryObjectFormat repository) (trimTrailingNewline contents) of
                 Just objectId -> pure (DetachedHead objectId)
                 Nothing -> ioError (userError "HEAD does not name a reference or an object")
+
+-- | Delete a loose reference and remove it from packed-refs if present.
+deleteRef :: Repository -> FilePath -> IO ()
+deleteRef repository refPath = do
+    validateRefPath refPath
+    let loosePath = repositoryGitDir repository </> refPath
+    looseExists <- doesFileExist loosePath
+    if looseExists then removeFile loosePath else pure ()
+    let packedPath = repositoryPackedRefsPath repository
+    packedExists <- doesFileExist packedPath
+    if packedExists
+        then do
+            packedRefs <- readPackedRefs repository
+            writeFileAtomically
+                packedPath
+                ( unlines
+                    ( ("# pack-refs with: peeled fully-peeled sorted")
+                        : [ objectIdToHex objectId ++ " " ++ name
+                          | (name, objectId) <- packedRefs
+                          , name /= refPath
+                          ]
+                    )
+                )
+        else pure ()
 
 -- | Write a loose reference. The name is validated, so an absolute path or a
 -- dot sequence from a remote advertisement cannot escape the repository.
@@ -87,7 +113,9 @@ readRefValue repository refPath
     | otherwise = do
         let fullPath = repositoryGitDir repository </> refPath
         exists <- doesFileExist fullPath
-        if not exists then pure Nothing else readReferenceFile fullPath
+        if not exists
+            then pure Nothing
+            else readReferenceFile (repositoryObjectFormat repository) fullPath
 
 updateHeadReference :: Repository -> ObjectId -> IO ()
 updateHeadReference repository objectId = do
@@ -136,6 +164,8 @@ listLooseRefs repository = do
     exists <- doesDirectoryExist refsDirectory
     if not exists then pure [] else walk refsDirectory ""
   where
+    objectFormat = repositoryObjectFormat repository
+
     walk directory prefix = do
         entries <- listDirectory directory
         fmap concat $
@@ -146,7 +176,7 @@ listLooseRefs repository = do
                 if isDirectory
                     then walk fullPath relativeName
                     else do
-                        maybeObjectId <- readReferenceFile fullPath
+                        maybeObjectId <- readReferenceFile objectFormat fullPath
                         pure
                             ( case maybeObjectId of
                                 Just objectId -> [("refs/" ++ relativeName, objectId)]
@@ -163,13 +193,15 @@ readPackedRefs repository = do
             contents <- readFile packedRefsPath
             pure (mapMaybe parseLine (lines contents))
   where
+    objectFormat = repositoryObjectFormat repository
+
     parseLine line
         | null stripped = Nothing
         | head stripped `elem` "#^" = Nothing
         | otherwise =
             case words stripped of
                 [objectIdText, refName] ->
-                    case objectIdFromHex objectIdText of
+                    case objectIdFromHexFor objectFormat objectIdText of
                         Just objectId -> Just (refName, objectId)
                         Nothing -> Nothing
                 _ -> Nothing
@@ -183,7 +215,7 @@ resolveRevision repository revision
     | null revision = pure Nothing
     | revision == "HEAD" = resolveHeadReference repository
     | otherwise =
-        case objectIdFromHex revision of
+        case objectIdFromHexFor (repositoryObjectFormat repository) revision of
             Just objectId -> pure (Just objectId)
             Nothing -> firstJustM (map lookupCandidate (candidateRefs revision))
   where
@@ -214,17 +246,22 @@ lookupRefWithDepth depth repository refPath
                 let firstLine = trimTrailingNewline contents
                 case stripPrefix "ref: " firstLine of
                     Just targetRef -> lookupRefWithDepth (depth - 1) repository targetRef
-                    Nothing -> pure (objectIdFromHex (trim firstLine))
+                    Nothing ->
+                        pure
+                            ( objectIdFromHexFor
+                                (repositoryObjectFormat repository)
+                                (trim firstLine)
+                            )
             else lookupPacked refPath
   where
     lookupPacked name = do
         packed <- readPackedRefs repository
         pure (lookup name packed)
 
-readReferenceFile :: FilePath -> IO (Maybe ObjectId)
-readReferenceFile path = do
+readReferenceFile :: HashAlgorithm -> FilePath -> IO (Maybe ObjectId)
+readReferenceFile objectFormat path = do
     contents <- readFile path
-    pure (objectIdFromHex (trimTrailingNewline contents))
+    pure (objectIdFromHexFor objectFormat (trimTrailingNewline contents))
 
 writeFileAtomically :: FilePath -> String -> IO ()
 writeFileAtomically path contents = do

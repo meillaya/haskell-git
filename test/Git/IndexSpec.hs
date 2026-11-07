@@ -105,10 +105,10 @@ sampleEntries = do
     pure
         ( sortOn
             indexEntryPath
-            [ IndexEntry (BS8.pack "a.txt") RegularFile 6 first
-            , IndexEntry (BS8.pack "run.sh") ExecutableFile 18 second
-            , IndexEntry (BS8.pack "link") Symlink 9 third
-            , IndexEntry (BS8.pack "docs/b.txt") RegularFile 4 fourth
+            [ IndexEntry (BS8.pack "a.txt") RegularFile 6 first 0
+            , IndexEntry (BS8.pack "run.sh") ExecutableFile 18 second 0
+            , IndexEntry (BS8.pack "link") Symlink 9 third 0
+            , IndexEntry (BS8.pack "docs/b.txt") RegularFile 4 fourth 0
             ]
         )
 
@@ -133,6 +133,7 @@ writeFilesAndStage repository files = foldFiles [] files
                     , indexEntryMode = mode
                     , indexEntrySize = fromIntegral (BS.length payload)
                     , indexEntryObjectId = objectId
+                    , indexEntryStage = 0
                     }
         foldFiles (upsertIndexEntry entry accumulated) rest
 
