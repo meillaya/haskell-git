@@ -6,17 +6,21 @@ module Git.Object
     , gitObject
     , gitObjectPayload
     , gitObjectType
+    , objectTypeFromName
+    , objectTypeName
     ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
+import Data.Char (isDigit)
 import Text.Read (readMaybe)
 
 data GitObjectType
     = BlobObject
     | TreeObject
     | CommitObject
+    | TagObject
     deriving (Eq, Show)
 
 data GitObject = GitObject
@@ -34,12 +38,27 @@ gitObjectType = objectType
 gitObjectPayload :: GitObject -> ByteString
 gitObjectPayload = objectPayload
 
+objectTypeName :: GitObjectType -> String
+objectTypeName BlobObject = "blob"
+objectTypeName TreeObject = "tree"
+objectTypeName CommitObject = "commit"
+objectTypeName TagObject = "tag"
+
+objectTypeFromName :: ByteString -> Maybe GitObjectType
+objectTypeFromName name =
+    case BS8.unpack name of
+        "blob" -> Just BlobObject
+        "tree" -> Just TreeObject
+        "commit" -> Just CommitObject
+        "tag" -> Just TagObject
+        _ -> Nothing
+
 encodeGitObject :: GitObject -> ByteString
 encodeGitObject currentObject =
     let payload = gitObjectPayload currentObject
         header =
             BS8.pack
-                (renderType (gitObjectType currentObject) ++ " " ++ show (BS.length payload))
+                (objectTypeName (gitObjectType currentObject) ++ " " ++ show (BS.length payload))
      in header <> BS.singleton 0 <> payload
 
 decodeGitObject :: ByteString -> Either String GitObject
@@ -49,8 +68,8 @@ decodeGitObject rawBytes = do
         then Left "Malformed Git object: missing NUL separator"
         else do
             let payload = BS.tail payloadWithNull
-            (objectTypeName, sizeText) <- parseHeader header
-            objectTypeValue <- parseType objectTypeName
+            (typeName, sizeText) <- parseHeader header
+            objectTypeValue <- parseType typeName
             expectedSize <- parseSize sizeText
             if BS.length payload /= expectedSize
                 then Left "Malformed Git object: payload length does not match header"
@@ -67,12 +86,19 @@ decodeGitObject rawBytes = do
             "blob" -> Right BlobObject
             "tree" -> Right TreeObject
             "commit" -> Right CommitObject
-            _ -> Left "Unsupported Git object type"
+            "tag" -> Right TagObject
+            _ -> Left "Malformed Git object: unknown type"
 
-    parseSize sizeText =
-        maybe (Left "Malformed Git object size") Right (readMaybe sizeText)
-
-renderType :: GitObjectType -> String
-renderType BlobObject = "blob"
-renderType TreeObject = "tree"
-renderType CommitObject = "commit"
+    -- Git writes the size in decimal with no sign and no leading zero. The
+    -- strict form matters: a malicious object store can otherwise smuggle in
+    -- ids that hash differently from what git would accept.
+    parseSize sizeText
+        | null sizeText = Left "Malformed Git object: empty size"
+        | not (all isDigit sizeText) = Left "Malformed Git object: size is not decimal"
+        | length sizeText > 1 && head sizeText == '0' =
+            Left "Malformed Git object: size has a leading zero"
+        | otherwise =
+            maybe
+                (Left "Malformed Git object: size overflows an integer")
+                Right
+                (readMaybe sizeText)

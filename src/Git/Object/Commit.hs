@@ -1,6 +1,5 @@
 module Git.Object.Commit
     ( Commit
-    , PersonIdent
     , commit
     , commitAuthor
     , commitCommitter
@@ -11,11 +10,7 @@ module Git.Object.Commit
     , commitTree
     , decodeCommit
     , encodeCommit
-    , personIdent
-    , personIdentEmail
-    , personIdentName
-    , personIdentTimestamp
-    , personIdentTimezone
+    , module Git.Object.Person
     ) where
 
 import Data.ByteString (ByteString)
@@ -23,15 +18,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import Git.Hash (ObjectId, objectIdFromHex, objectIdToHex)
 import Git.Object (GitObject, GitObjectType (CommitObject), gitObject, gitObjectPayload, gitObjectType)
-import Text.Read (readMaybe)
-
-data PersonIdent = PersonIdent
-    { personIdentName :: ByteString
-    , personIdentEmail :: ByteString
-    , personIdentTimestamp :: Integer
-    , personIdentTimezone :: ByteString
-    }
-    deriving (Eq, Show)
+import Git.Object.Person
 
 data Commit = Commit
     { commitTree :: ObjectId
@@ -41,9 +28,6 @@ data Commit = Commit
     , commitMessage :: ByteString
     }
     deriving (Eq, Show)
-
-personIdent :: ByteString -> ByteString -> Integer -> ByteString -> PersonIdent
-personIdent = PersonIdent
 
 commit :: ObjectId -> [ObjectId] -> PersonIdent -> PersonIdent -> ByteString -> Commit
 commit = Commit
@@ -62,6 +46,9 @@ encodeCommit currentCommit =
                ]
         )
 
+-- | Decode the headers this library reads. Signature, encoding, and merge tag
+-- headers are skipped here on purpose: callers that need a byte-exact object
+-- read the raw payload instead of round tripping through this type.
 decodeCommit :: ByteString -> Either String Commit
 decodeCommit rawCommit = do
     let (headerPart, messagePartWithSeparator) = BS8.breakSubstring (BS8.pack "\n\n") rawCommit
@@ -99,25 +86,10 @@ parseObjectIdLine prefix line =
         Just objectId -> Right objectId
 
 parsePersonLine :: String -> ByteString -> Either String PersonIdent
-parsePersonLine prefix line = do
-    let payload = BS.drop (length prefix + 1) line
-        (namePart, afterName) = BS8.breakSubstring (BS8.pack " <") payload
-    if BS.null afterName
-        then Left ("Malformed commit: invalid " ++ prefix ++ " identity")
-        else do
-            let emailAndRest = BS.drop 2 afterName
-                (emailPart, afterEmail) = BS8.break (== '>') emailAndRest
-            if BS.null afterEmail
-                then Left ("Malformed commit: invalid " ++ prefix ++ " email")
-                else do
-                    let restWords = BS8.words (BS.drop 1 afterEmail)
-                    case restWords of
-                        [timestampText, timezoneText] ->
-                            case readMaybe (BS8.unpack timestampText) of
-                                Nothing -> Left ("Malformed commit: invalid " ++ prefix ++ " timestamp")
-                                Just timestamp ->
-                                    Right (personIdent namePart emailPart timestamp timezoneText)
-                        _ -> Left ("Malformed commit: invalid " ++ prefix ++ " metadata")
+parsePersonLine prefix line =
+    case parsePersonIdent (BS.drop (length prefix + 1) line) of
+        Left err -> Left ("Malformed commit: " ++ err)
+        Right ident -> Right ident
 
 commitToObject :: Commit -> GitObject
 commitToObject = gitObject CommitObject . encodeCommit
@@ -127,13 +99,3 @@ commitFromObject currentObject =
     if gitObjectType currentObject == CommitObject
         then decodeCommit (gitObjectPayload currentObject)
         else Left "Expected a commit object"
-
-renderPersonIdent :: PersonIdent -> ByteString
-renderPersonIdent ident =
-    personIdentName ident
-        <> BS8.pack " <"
-        <> personIdentEmail ident
-        <> BS8.pack "> "
-        <> BS8.pack (show (personIdentTimestamp ident))
-        <> BS8.pack " "
-        <> personIdentTimezone ident

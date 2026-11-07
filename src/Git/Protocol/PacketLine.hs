@@ -47,17 +47,30 @@ decodePacketLines rawBytes
         if packetLength == flushPacketLength
             then (FlushPacket :) <$> decodePacketLines remaining
             else do
-                let payloadLength = packetLength - 4
-                if payloadLength < 0 || BS.length remaining < payloadLength
-                    then Left "Malformed pkt-line stream: truncated payload"
+                -- Lengths 1 to 3 mark protocol v2 delimiters. A v0 stream never
+                -- contains one, so name the problem instead of calling it a
+                -- truncated payload.
+                if packetLength <= specialPacketLimit
+                    then Left "Malformed pkt-line stream: protocol v2 special packet in a v0 stream"
                     else do
-                        let (payload, rest) = BS.splitAt payloadLength remaining
-                        (DataPacket payload :) <$> decodePacketLines rest
+                        let payloadLength = packetLength - 4
+                        if BS.length remaining < payloadLength
+                            then Left "Malformed pkt-line stream: truncated payload"
+                            else do
+                                let (payload, rest) = BS.splitAt payloadLength remaining
+                                (DataPacket payload :) <$> decodePacketLines rest
   where
     parseLength prefix =
         case readHex (BS8.unpack prefix) of
-            [(parsedLength, "")] -> Right parsedLength
+            [(parsedLength, "")] | parsedLength <= maximumPacketLength -> Right parsedLength
+            [(_, "")] -> Left "Malformed pkt-line stream: length prefix overflows the maximum"
             _ -> Left "Malformed pkt-line stream: invalid length prefix"
+
+specialPacketLimit :: Int
+specialPacketLimit = 3
+
+maximumPacketLength :: Int
+maximumPacketLength = 65520
 
 padHex :: Int -> String
 padHex value =

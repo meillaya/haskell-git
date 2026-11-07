@@ -1,0 +1,6 @@
+# devenv inputs. The lock file pins the resolved revisions; commit both.
+require_version: ">=2.1"
+
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling

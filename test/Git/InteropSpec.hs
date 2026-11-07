@@ -2,162 +2,149 @@ module Git.InteropSpec
     ( run
     ) where
 
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
+import Data.List (sort)
 import Git.Hash (objectIdFromHex, objectIdToHex)
-import Git.Object.Blob (blobContents, blobFromBytes, blobFromObject, blobToObject)
-import Git.Object.Commit (commit, commitToObject, personIdent)
-import Git.Object.Loose (readLooseObject, writeLooseObject)
-import Git.Object.Tree (TreeEntryMode (RegularFile), renderTreeEntry, treeEntry, treeFromObject, treeToObject)
-import Git.Refs (currentHeadCommit, updateHeadReference)
-import Git.Repo (initRepository, repositoryAt)
-import System.Exit (ExitCode (ExitSuccess))
-import System.Process (proc, readCreateProcessWithExitCode)
-import TestSupport (assert, assertEqual, withTempDirectory)
+import Git.Index (IndexEntry (..), buildTreeFromIndex, writeIndex)
+import Git.Object.Blob (blobFromBytes, blobToObject)
+import Git.Object.Commit (commit, commitFromObject, commitToObject, commitTree, personIdent)
+import Git.Object.Loose (writeLooseObject)
+import Git.Object.Tree (TreeEntryMode (..), treeEntry, treeToObject)
+import Git.Refs (updateHeadReference)
+import Git.Repo (Repository, findRepository, initRepository, repositoryIndexPath, repositoryRootDir)
+import Git.Store (flattenTree, loadStore, readObjectOrFail)
+import System.Directory (createDirectoryIfMissing)
+import System.FilePath ((</>), takeDirectory)
+import TestSupport (assert, assertEqual, runGit, withTempDirectory)
 
+-- | Check both directions of interoperability: git reads the objects this
+-- project writes, this project reads the objects git writes into a packed
+-- repository, and a commit written through the library is accepted by git.
 run :: IO ()
 run = do
     gitReadsOurInit
-    gitReadsOurBlob
-    weReadGitBlob
-    gitReadsOurTree
-    weReadGitTree
-    gitReadsOurCommit
+    gitReadsOurObjects
+    weReadGitObjects
+    writePathCreatesCommit
 
+-- | Create a repository here and inspect it with git.
 gitReadsOurInit :: IO ()
 gitReadsOurInit =
     withTempDirectory "haskell-git-init-interop" $ \temporaryDir -> do
         _ <- initRepository temporaryDir
-        (gitDirExit, gitDirStdout, gitDirStderr) <-
-            readCreateProcessWithExitCode
-                (proc "git" ["-C", temporaryDir, "rev-parse", "--git-dir"])
-                ""
-        assert (gitDirExit == ExitSuccess) ("git rev-parse --git-dir failed: " ++ gitDirStderr)
-        assertEqual ".git\n" gitDirStdout "Git should recognize the initialized .git directory"
-        (headExit, headStdout, headStderr) <-
-            readCreateProcessWithExitCode
-                (proc "git" ["-C", temporaryDir, "symbolic-ref", "HEAD"])
-                ""
-        assert (headExit == ExitSuccess) ("git symbolic-ref HEAD failed: " ++ headStderr)
-        assertEqual "refs/heads/master\n" headStdout "Git should recognize the symbolic HEAD written by init"
+        gitDirText <- runGit ["-C", temporaryDir, "rev-parse", "--git-dir"]
+        assertEqual ".git\n" gitDirText "Git should recognise the .git directory"
+        headText <- runGit ["-C", temporaryDir, "symbolic-ref", "HEAD"]
+        assertEqual "refs/heads/main\n" headText "Git should see the default branch"
 
-gitReadsOurBlob :: IO ()
-gitReadsOurBlob =
-    withTempDirectory "haskell-git-interop-write" $ \temporaryDir -> do
+-- | Write a blob, tree, and commit here and read them with git.
+gitReadsOurObjects :: IO ()
+gitReadsOurObjects =
+    withTempDirectory "haskell-git-object-interop" $ \temporaryDir -> do
         repository <- initRepository temporaryDir
-        let expectedContents = BS8.pack "hello from haskell-git\n"
-        objectId <- writeLooseObject repository (blobToObject (blobFromBytes expectedContents))
-        (exitCode, stdoutText, stderrText) <-
-            readCreateProcessWithExitCode
-                (proc "git" ["-C", temporaryDir, "cat-file", "-p", objectIdToHex objectId])
-                ""
-        assert (exitCode == ExitSuccess) ("git cat-file failed: " ++ stderrText)
-        assertEqual expectedContents (BS8.pack stdoutText) "Git should read blobs written by this project"
-
-weReadGitBlob :: IO ()
-weReadGitBlob =
-    withTempDirectory "haskell-git-interop-read" $ \temporaryDir -> do
-        _ <- initRepository temporaryDir
-        let expectedContents = BS8.pack "hello from git\n"
-        (exitCode, stdoutText, stderrText) <-
-            readCreateProcessWithExitCode
-                ((proc "git" ["-C", temporaryDir, "hash-object", "-w", "--stdin"]))
-                (BS8.unpack expectedContents)
-        assert (exitCode == ExitSuccess) ("git hash-object failed: " ++ stderrText)
-        objectId <-
-            maybe
-                (fail "git returned an invalid object id")
-                pure
-                (objectIdFromHex (trimTrailingNewline stdoutText))
-        gitObject <- readLooseObject (repositoryAt temporaryDir) objectId
-        blob <- either fail pure (blobFromObject gitObject)
-        assertEqual expectedContents (blobContents blob) "This project should read blobs written by Git"
-
-trimTrailingNewline :: String -> String
-trimTrailingNewline = reverse . dropWhile (`elem` "\r\n") . reverse
-
-gitReadsOurTree :: IO ()
-gitReadsOurTree =
-    withTempDirectory "haskell-git-tree-write" $ \temporaryDir -> do
-        repository <- initRepository temporaryDir
-        let blobContentsBytes = BS8.pack "tree blob\n"
-        blobId <- writeLooseObject repository (blobToObject (blobFromBytes blobContentsBytes))
+        let author = personIdent (BS8.pack "Ada") (BS8.pack "ada@example.com") 1713220000 (BS8.pack "+0000")
+        blobId <- writeLooseObject repository (blobToObject (blobFromBytes (BS8.pack "hello\n")))
+        nestedTreeId <-
+            writeLooseObject
+                repository
+                (treeToObject [treeEntry RegularFile (BS8.pack "nested.txt") blobId])
         treeId <-
             writeLooseObject
                 repository
-                (treeToObject [treeEntry RegularFile (BS8.pack "hello.txt") blobId])
-        (exitCode, stdoutText, stderrText) <-
-            readCreateProcessWithExitCode
-                (proc "git" ["-C", temporaryDir, "ls-tree", objectIdToHex treeId])
-                ""
-        assert (exitCode == ExitSuccess) ("git ls-tree failed: " ++ stderrText)
+                ( treeToObject
+                    [ treeEntry RegularFile (BS8.pack "hello.txt") blobId
+                    , treeEntry Directory (BS8.pack "docs") nestedTreeId
+                    ]
+                )
+        blobText <- runGit ["-C", temporaryDir, "cat-file", "-p", objectIdToHex blobId]
+        assertEqual "hello\n" blobText "Git should read a blob written by this project"
+        treeText <- runGit ["-C", temporaryDir, "ls-tree", objectIdToHex treeId]
         assertEqual
-            ("100644 blob " ++ objectIdToHex blobId ++ "\thello.txt\n")
-            stdoutText
-            "Git should inspect trees written by this project"
+            [ "040000 tree " ++ objectIdToHex nestedTreeId ++ "\tdocs"
+            , "100644 blob " ++ objectIdToHex blobId ++ "\thello.txt"
+            ][treeLine | treeLine <- lines treeText, not (null treeLine)]
+            "Git should read a tree written by this project"
+        let currentCommit = commit treeId [] author author (BS8.pack "Initial commit\n")
+        commitId <- writeLooseObject repository (commitToObject currentCommit)
+        updateHeadReference repository commitId
+        commitText <- runGit ["-C", temporaryDir, "cat-file", "-p", objectIdToHex commitId]
+        assert (("tree " ++ objectIdToHex treeId) `isLineOf` commitText) "Git should show the tree line"
+        assert (("author Ada <ada@example.com> 1713220000 +0000") `isLineOf` commitText) "Git should show the author line"
+        headCommit <- runGit ["-C", temporaryDir, "rev-parse", "HEAD"]
+        assertEqual (objectIdToHex commitId ++ "\n") headCommit "Git should resolve the commit HEAD points at"
 
-weReadGitTree :: IO ()
-weReadGitTree =
-    withTempDirectory "haskell-git-tree-read" $ \temporaryDir -> do
-        _ <- initRepository temporaryDir
-        let blobContentsBytes = BS8.pack "tree from git\n"
-        (blobExit, blobStdout, blobStderr) <-
-            readCreateProcessWithExitCode
-                (proc "git" ["-C", temporaryDir, "hash-object", "-w", "--stdin"])
-                (BS8.unpack blobContentsBytes)
-        assert (blobExit == ExitSuccess) ("git hash-object for tree setup failed: " ++ blobStderr)
-        let blobIdText = trimTrailingNewline blobStdout
-        (indexExit, _, indexStderr) <-
-            readCreateProcessWithExitCode
-                (proc "git" ["-C", temporaryDir, "update-index", "--add", "--cacheinfo", "100644", blobIdText, "hello.txt"])
-                ""
-        assert (indexExit == ExitSuccess) ("git update-index failed: " ++ indexStderr)
-        (treeExit, treeStdout, treeStderr) <-
-            readCreateProcessWithExitCode
-                (proc "git" ["-C", temporaryDir, "write-tree"])
-                ""
-        assert (treeExit == ExitSuccess) ("git write-tree failed: " ++ treeStderr)
-        treeId <-
-            maybe
-                (fail "git returned an invalid tree id")
-                pure
-                (objectIdFromHex (trimTrailingNewline treeStdout))
-        gitObject <- readLooseObject (repositoryAt temporaryDir) treeId
-        treeEntries <- either fail pure (treeFromObject gitObject)
-        assert (length treeEntries == 1) "This project should decode a single Git tree entry"
+-- | Pack a repository with git and read its tree here.
+weReadGitObjects :: IO ()
+weReadGitObjects =
+    withTempDirectory "haskell-git-read-interop" $ \temporaryDir -> do
+        _ <- runGit ["init", "-q", "-b", "main", temporaryDir]
+        _ <- runGit ["-C", temporaryDir, "config", "user.email", "ada@example.com"]
+        _ <- runGit ["-C", temporaryDir, "config", "user.name", "Ada"]
+        createDirectoryIfMissing True (temporaryDir </> "docs")
+        writeFile (temporaryDir </> "hello.txt") "hello from git\n"
+        writeFile (temporaryDir </> "docs" </> "nested.txt") "nested\n"
+        _ <- runGit ["-C", temporaryDir, "add", "-A"]
+        _ <- runGit ["-C", temporaryDir, "commit", "-qm", "first"]
+        _ <- runGit ["-C", temporaryDir, "gc", "-q"]
+        repository <- requireRepository temporaryDir
+        store <- loadStore repository
+        headText <- trim <$> runGit ["-C", temporaryDir, "rev-parse", "HEAD"]
+        headCommitId <-
+            maybe (fail "git returned an invalid commit id") pure (objectIdFromHex headText)
+        headObject <- readObjectOrFail store headCommitId
+        currentCommit <- either fail pure (commitFromObject headObject)
+        flattened <- flattenTree store (commitTree currentCommit)
         assertEqual
-            ("100644 blob " ++ blobIdText ++ "\thello.txt")
-            (renderTreeEntry (head treeEntries))
-            "This project should read trees written by Git"
+            ["docs/nested.txt", "hello.txt"]
+            (sort (map fst flattened))
+            "Reading git's packed tree should produce the same paths"
 
-gitReadsOurCommit :: IO ()
-gitReadsOurCommit =
-    withTempDirectory "haskell-git-commit-write" $ \temporaryDir -> do
+-- | Stage, write a tree, commit, and point HEAD here, then check with git.
+writePathCreatesCommit :: IO ()
+writePathCreatesCommit =
+    withTempDirectory "haskell-git-write-interop" $ \temporaryDir -> do
         repository <- initRepository temporaryDir
-        blobId <- writeLooseObject repository (blobToObject (blobFromBytes (BS8.pack "commit blob\n")))
-        treeId <- writeLooseObject repository (treeToObject [treeEntry RegularFile (BS8.pack "hello.txt") blobId])
-        let author = personIdent (BS8.pack "Ada Lovelace") (BS8.pack "ada@example.com") 1713220000 (BS8.pack "+0000")
-            firstCommit = commit treeId [] author author (BS8.pack "Initial commit\n")
-        firstCommitId <- writeLooseObject repository (commitToObject firstCommit)
-        updateHeadReference repository firstCommitId
-        currentCommit <- currentHeadCommit repository
-        assertEqual
-            (Just firstCommitId)
-            currentCommit
-            "Updating HEAD should point the current branch at the first commit"
-        let secondCommit = commit treeId [firstCommitId] author author (BS8.pack "Second commit\n")
-        secondCommitId <- writeLooseObject repository (commitToObject secondCommit)
-        updateHeadReference repository secondCommitId
-        (exitCode, stdoutText, stderrText) <-
-            readCreateProcessWithExitCode
-                (proc "git" ["-C", temporaryDir, "cat-file", "-p", objectIdToHex secondCommitId])
-                ""
-        assert (exitCode == ExitSuccess) ("git cat-file for commit failed: " ++ stderrText)
-        assert
-            (("tree " ++ objectIdToHex treeId) `elem` lines stdoutText)
-            "Git should show the commit's tree entry"
-        assert
-            (("parent " ++ objectIdToHex firstCommitId) `elem` lines stdoutText)
-            "Git should show the commit's parent entry"
-        assert
-            ("author Ada Lovelace <ada@example.com> 1713220000 +0000" `elem` lines stdoutText)
-            "Git should show the commit author metadata"
+        firstEntries <- stageFileAt [] repository "hello.txt" "hello\n"
+        entries <- stageFileAt firstEntries repository "docs/nested.txt" "nested\n"
+        BS.writeFile (repositoryIndexPath repository) (writeIndex entries)
+        treeId <- buildTreeFromIndex repository entries
+        let author = personIdent (BS8.pack "Ada") (BS8.pack "ada@example.com") 1713220000 (BS8.pack "+0000")
+            currentCommit = commit treeId [] author author (BS8.pack "First commit\n")
+        commitId <- writeLooseObject repository (commitToObject currentCommit)
+        updateHeadReference repository commitId
+        statusText <- runGit ["-C", temporaryDir, "status", "--porcelain"]
+        assertEqual "" statusText "git status should be clean after staging through this project"
+        fsckText <- runGit ["-C", temporaryDir, "fsck", "--strict"]
+        assertEqual "" fsckText "git fsck should accept the commit written by this project"
+        logText <- runGit ["-C", temporaryDir, "log", "--format=%H"]
+        assertEqual (objectIdToHex commitId) (trim logText) "git log should show the new commit"
+
+stageFileAt :: [IndexEntry] -> Repository -> FilePath -> String -> IO [IndexEntry]
+stageFileAt entries repository relativePath contents = do
+    let destination = repositoryRootDir repository </> relativePath
+        payload = BS8.pack contents
+    createDirectoryIfMissing True (takeDirectory destination)
+    BS.writeFile destination payload
+    objectId <- writeLooseObject repository (blobToObject (blobFromBytes payload))
+    pure
+        ( entries
+            ++ [ IndexEntry
+                    { indexEntryPath = BS8.pack relativePath
+                    , indexEntryMode = RegularFile
+                    , indexEntrySize = fromIntegral (BS.length payload)
+                    , indexEntryObjectId = objectId
+                    }
+               ]
+        )
+
+requireRepository :: FilePath -> IO Repository
+requireRepository temporaryDir = do
+    found <- findRepository temporaryDir
+    maybe (fail "the fixture directory should be a repository") pure found
+
+isLineOf :: String -> String -> Bool
+isLineOf needle haystack = needle `elem` lines haystack
+
+trim :: String -> String
+trim = reverse . dropWhile (`elem` "\r\n") . reverse
