@@ -4,11 +4,27 @@ module Git.TransportSpec
 
 import Control.Exception (bracket)
 import Control.Concurrent (threadDelay)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import qualified Data.ByteString.Char8 as BS8
 import Git.Clone (CloneResult (..), cloneRepository)
+import Git.Config (loadGlobalConfig)
 import Git.Fetch (defaultFetchOptions, fetchRepository)
+import Git.Protocol.SmartHTTP
+    ( discoveryCapabilities
+    , discoveryRefObjectId
+    , discoveryRefs
+    )
 import Git.Push (defaultPushOptions, pushRepository)
 import Git.Repo (Repository, findRepository)
-import System.Directory (createDirectoryIfMissing)
+import Git.Transport
+    ( FetchProgress (..)
+    , Service (..)
+    , Transport (..)
+    , transportUploadPackToFileFor
+    , withTemporaryPack
+    , withTransport
+    )
+import System.Directory (createDirectoryIfMissing, getFileSize)
 import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.FilePath ((</>))
 import System.Process
@@ -22,6 +38,7 @@ import System.Process
     )
 import TestSupport
     ( assert
+    , assertContains
     , assertEqual
     , runBash
     , runGit
@@ -36,6 +53,7 @@ run = do
     sshProtocolV0FallbackClone
     sshPush
     gitDaemonCloneAndFetch
+    gitDaemonV2ProgressReporting
     gitDaemonPush
     httpProtocolV2CloneAndFetch
     httpProtocolV2Sha256Clone
@@ -266,6 +284,52 @@ gitDaemonCloneAndFetch =
                 assertEqual sourceHead fetchedHead "protocol v2 git:// fetch should update the tracking ref"
                 _ <- runGit ["-C", destination, "fsck", "--strict"]
                 pure ()
+            )
+
+-- | A protocol v2 fetch over git:// must surface the server's sideband
+-- progress messages and report the number of pack bytes received.
+gitDaemonV2ProgressReporting :: IO ()
+gitDaemonV2ProgressReporting =
+    withTempDirectory "haskell-git-gitdaemon-progress" $ \temporaryDir -> do
+        let sourceDirectory = temporaryDir </> "source"
+            serveDirectory = temporaryDir </> "serve"
+            bareRepository = serveDirectory </> "repo.git"
+        _ <- createSource sourceDirectory
+        createDirectoryIfMissing True serveDirectory
+        _ <- runGit ["clone", "-q", "--bare", sourceDirectory, bareRepository]
+        port <- trim <$> runBash "python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); print(s.getsockname()[1]); s.close()'"
+        bracket
+            (startDaemon serveDirectory port)
+            stopDaemon
+            (\_ -> do
+                recordedMessages <- newIORef []
+                recordedBytes <- newIORef 0
+                let progress =
+                        FetchProgress
+                            (\bytes -> writeIORef recordedBytes bytes)
+                            (\message -> modifyIORef' recordedMessages (message :))
+                config <- loadGlobalConfig
+                withTransport config ("git://127.0.0.1:" ++ port ++ "/repo.git") $ \transport -> do
+                    advertisement <- transportDiscovery transport UploadPackService
+                    withTemporaryPack $ \packPath -> do
+                        transportUploadPackToFileFor
+                            transport
+                            advertisement
+                            (discoveryCapabilities advertisement)
+                            (map discoveryRefObjectId (discoveryRefs advertisement))
+                            []
+                            progress
+                            packPath
+                        packSize <- getFileSize packPath
+                        reportedBytes <- readIORef recordedBytes
+                        assertEqual
+                            (fromIntegral packSize)
+                            reportedBytes
+                            "the transport should report every received pack byte"
+                        messages <- readIORef recordedMessages
+                        assert (not (null messages)) "protocol v2 should deliver remote progress messages"
+                        let messageText = BS8.unpack (BS8.concat (reverse messages))
+                        assertContains "objects" messageText "remote progress should mention objects"
             )
 
 gitDaemonPush :: IO ()

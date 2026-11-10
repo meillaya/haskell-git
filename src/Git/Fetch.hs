@@ -3,9 +3,12 @@ module Git.Fetch
     , FetchResult (..)
     , defaultFetchOptions
     , fetchRepository
+    , fetchRepositoryWithProgress
     ) where
 
+import Control.Exception (onException)
 import Control.Monad (forM, when)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS8
 import Data.List (find, isPrefixOf, isSuffixOf, nub)
@@ -14,7 +17,19 @@ import qualified Data.Set as Set
 import Git.Config (Config, configGet, configGetAll, loadRepositoryConfig)
 import Git.Hash (ObjectId, objectIdToHex)
 import Git.Pack.Import (importPackFile)
-import Git.Pack.Retain (retainPackFile)
+import Git.Pack.Retain (retainPackDirectly, retainPackFile)
+import Git.Progress
+    ( Phase (..)
+    , Progress
+    , noProgress
+    , progressAbort
+    , progressBegin
+    , progressEnd
+    , progressFinish
+    , progressNetwork
+    , progressObjects
+    , progressRemote
+    )
 import Git.Protocol.SmartHTTP
     ( DiscoveryAdvertisement
     , DiscoveryRef
@@ -38,7 +53,8 @@ import Git.Repo
     )
 import Git.Store (Store, loadStore, readObjectOrFail, walkCommits)
 import Git.Transport
-    ( Service (..)
+    ( FetchProgress (..)
+    , Service (..)
     , Transport (..)
     , transportUploadPackToFileFor
     , parseRemoteUrl
@@ -50,11 +66,12 @@ data FetchOptions = FetchOptions
     { fetchTags :: Bool
     , fetchNoTags :: Bool
     , fetchPrune :: Bool
+    , fetchProgressMode :: Maybe Bool
     }
     deriving (Eq, Show)
 
 defaultFetchOptions :: FetchOptions
-defaultFetchOptions = FetchOptions False False False
+defaultFetchOptions = FetchOptions False False False Nothing
 
 data FetchResult = FetchResult
     { fetchUpdatedRefs :: [(FilePath, ObjectId)]
@@ -72,7 +89,17 @@ data Remote = Remote
 -- updated, FETCH_HEAD is written, and the pack is imported with the streaming
 -- importer.
 fetchRepository :: Repository -> String -> [String] -> FetchOptions -> IO FetchResult
-fetchRepository repository remoteArgument explicitRefSpecs options = do
+fetchRepository = fetchRepositoryWithProgress noProgress
+
+-- | Fetch and report progress to the given renderer.
+fetchRepositoryWithProgress
+    :: Progress
+    -> Repository
+    -> String
+    -> [String]
+    -> FetchOptions
+    -> IO FetchResult
+fetchRepositoryWithProgress progress repository remoteArgument explicitRefSpecs options = do
     config <- loadRepositoryConfig repository
     remote <- resolveRemote config remoteArgument
     requestedSpecs <-
@@ -117,17 +144,38 @@ fetchRepository repository remoteArgument explicitRefSpecs options = do
             fetchedRefs = map discoveryRefObjectId (map (\(ref, _, _) -> ref) matched)
             tagIds = map discoveryRefObjectId allTagRefs
             wantedIds = nub (fetchedRefs ++ tagIds)
-        when (not (null wantedIds)) $
-            withTemporaryPack $ \packPath -> do
+        when (not (null wantedIds)) $ do
+            progressBegin progress PhaseReceiving
+            deltaRef <- newIORef (0 :: Int)
+            let fetchProgress =
+                    FetchProgress (progressNetwork progress) (progressRemote progress)
+            ( withTemporaryPack $ \packPath -> do
                 transportUploadPackToFileFor
                     transport
                     advertisement
                     (discoveryCapabilities advertisement)
                     wantedIds
                     haves
+                    fetchProgress
                     packPath
-                importPackFile objectFormat repository packPath
-                retainPackFile objectFormat repository packPath
+                retainedDirectly <-
+                    retainPackDirectly
+                        objectFormat
+                        repository
+                        packPath
+                        (progressObjects progress)
+                        (\_ total -> writeIORef deltaRef total)
+                when (not retainedDirectly) $ do
+                    importPackFile objectFormat repository packPath (progressObjects progress)
+                    retainPackFile objectFormat repository packPath
+                )
+                `onException` progressAbort progress
+            progressEnd progress PhaseReceiving
+            deltaTotal <- readIORef deltaRef
+            when (deltaTotal > 0) $ do
+                progressBegin progress PhaseResolvingDeltas
+                progressObjects progress deltaTotal deltaTotal
+                progressEnd progress PhaseResolvingDeltas
         updated <- updateRefs repository matched
         autoTags <-
             if fetchNoTags options || fetchTags options
@@ -143,6 +191,7 @@ fetchRepository repository remoteArgument explicitRefSpecs options = do
                 case matched of
                     ((remoteRef, _, _) : _) -> Just (discoveryRefObjectId remoteRef)
                     [] -> Nothing
+        progressFinish progress
         pure
             FetchResult
                 { fetchUpdatedRefs = updated ++ updatedTags

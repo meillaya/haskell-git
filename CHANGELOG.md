@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Clone, fetch, and pull display git-style progress on a terminal: the
+  server's sideband progress messages, a live per-phase bar with byte
+  count/rate and an elapsed timer, `remote:` lines collapsed to their final
+  CR-redraw segment, and `--progress`/`--no-progress` flags. The rate is the
+  average over the network window, not the last packet.
+- Fetch completes thin packs like `git index-pack --fix-thin`: missing delta
+  bases are read from the local object store, appended as full entries to a
+  completed pack with a rewritten header/trailer, resolved, and retained with
+  a v2 index. Incremental fetches no longer fall back to loose objects or fail
+  when a base lives in an earlier retained pack.
+- Fixed the appended-base offsets in completed thin packs (real entry offsets
+  instead of consecutive integers) and deferred offset deltas whose base entry
+  is itself a pending external-base reference delta.
+- docs/reflections.md documents both optimization passes with cost models,
+  derivations, measured tables, and Excalidraw figures; docs/figures/RULES.md
+  and scripts/optimization-benchmark.sh make the figures and measurements
+  reproducible.
 - Clone indexes a self-contained pack in one streaming pass and retains it
   directly, resolving delta bases through a temporary uncompressed object
   cache instead of writing, re-reading, and deleting every object as a loose

@@ -17,14 +17,17 @@ category:           Development
 build-type:         Simple
 extra-doc-files:    CHANGELOG.md
                     README.md
+                    docs/reflections.md
 
 extra-source-files:
     devenv.nix
     devenv.lock
     devenv.yaml
+    docs/figures/RULES.md
     docs/nix.md
     flake.nix
     flake.lock
+    scripts/optimization-benchmark.sh
     docs/figures/*.excalidraw
     docs/figures/*.png
     docs/figures/gen_figures.py
@@ -67,6 +70,7 @@ library
         Git.Pack.Write
         Git.Protocol.PacketLine
         Git.Protocol.SmartHTTP
+        Git.Progress
         Git.Pull
         Git.Push
         Git.Rebase
@@ -143,8 +147,10 @@ test-suite haskell-git-test
         Git.Pack.DeltaSpec
         Git.Pack.IndexSpec
         Git.Pack.ReadSpec
+        Git.Pack.RetainSpec
         Git.Pack.StreamingSpec
         Git.PackSpec
+        Git.ProgressSpec
         Git.PropertySpec
         Git.Protocol.PacketLineSpec
         Git.Protocol.SmartHTTPSpec

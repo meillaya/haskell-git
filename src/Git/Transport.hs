@@ -1,7 +1,9 @@
 module Git.Transport
-    ( RemoteUrl (..)
+    ( FetchProgress (..)
+    , RemoteUrl (..)
     , Service (..)
     , Transport (..)
+    , noFetchProgress
     , parseRemoteUrl
     , transportUploadPackToFileFor
     , withTemporaryPack
@@ -18,7 +20,7 @@ import qualified Data.ByteString.Lazy as BL
 import Data.Char (isSpace, toLower)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (isPrefixOf)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe)
 import Network.HTTP.Client
     ( BodyReader
     , Manager
@@ -99,11 +101,7 @@ import Git.Protocol.SmartHTTP
     , SmartHttpEndpoint (..)
     , capabilityValue
     , discoveryCapabilities
-    , discoveryObjectFormat
     , discoveryProtocolVersion
-    , discoveryRefName
-    , discoveryRefObjectId
-    , discoveryRefs
     , defaultSmartHttpEndpoint
     , parseDiscoveryResponseFor
     , parseRefAdvertisement
@@ -113,6 +111,17 @@ data Service
     = UploadPackService
     | ReceivePackService
     deriving (Eq, Show)
+
+-- | Progress callbacks for a pack download. The transport reports the number
+-- of pack bytes received (cumulative) and any server-side progress messages,
+-- which arrive on the sideband progress band of a protocol v2 response.
+data FetchProgress = FetchProgress
+    { fetchProgressBytes :: Integer -> IO ()
+    , fetchProgressRemote :: ByteString -> IO ()
+    }
+
+noFetchProgress :: FetchProgress
+noFetchProgress = FetchProgress (const (pure ())) (const (pure ()))
 
 -- | A parsed remote URL. Only HTTP(S), SSH, and git:// are accepted; local
 -- paths are deliberately out of scope.
@@ -133,8 +142,8 @@ data RemoteUrl
 
 data Transport = Transport
     { transportDiscovery :: Service -> IO DiscoveryAdvertisement
-    , transportUploadPackToFile :: [ByteString] -> [ObjectId] -> [ObjectId] -> FilePath -> IO ()
-    , transportUploadPackV2ToFile :: Maybe ([ByteString] -> [ObjectId] -> [ObjectId] -> FilePath -> IO ())
+    , transportUploadPackToFile :: [ByteString] -> [ObjectId] -> [ObjectId] -> FetchProgress -> FilePath -> IO ()
+    , transportUploadPackV2ToFile :: Maybe ([ByteString] -> [ObjectId] -> [ObjectId] -> FetchProgress -> FilePath -> IO ())
     , transportReceivePack :: ByteString -> Maybe FilePath -> IO ByteString
     }
 
@@ -146,12 +155,13 @@ transportUploadPackToFileFor
     -> [ByteString]
     -> [ObjectId]
     -> [ObjectId]
+    -> FetchProgress
     -> FilePath
     -> IO ()
-transportUploadPackToFileFor transport advertisement capabilities wantedIds haves destination =
+transportUploadPackToFileFor transport advertisement capabilities wantedIds haves progress destination =
     case (discoveryProtocolVersion advertisement, transportUploadPackV2ToFile transport) of
-        (2, Just uploadV2) -> uploadV2 capabilities wantedIds haves destination
-        _ -> transportUploadPackToFile transport capabilities wantedIds haves destination
+        (2, Just uploadV2) -> uploadV2 capabilities wantedIds haves progress destination
+        _ -> transportUploadPackToFile transport capabilities wantedIds haves progress destination
 
 -- | The server's first protocol message on a stream transport (SSH or
 -- git://). Protocol v0 starts with a ref advertisement; protocol v2 starts
@@ -207,9 +217,9 @@ discoverRefsV2 inputHandle outputHandle capabilities = do
         Left err -> ioError (userError err)
         Right advertisement -> pure advertisement
 
-writeV2FetchResponseFromHandle :: Handle -> FilePath -> IO ()
-writeV2FetchResponseFromHandle handle destination =
-    writeV2FetchResponse (handleSource handle) destination
+writeV2FetchResponseFromHandle :: FetchProgress -> Handle -> FilePath -> IO ()
+writeV2FetchResponseFromHandle progress handle destination =
+    writeV2FetchResponse progress (handleSource handle) destination
 
 hCloseIfOpen :: Handle -> IO ()
 hCloseIfOpen handle = do
@@ -349,14 +359,14 @@ withSshTransport config remote action = do
                     \service ->
                         sshDiscovery command baseArguments remote (attemptV2 && service == UploadPackService) service
                 , transportUploadPackToFile =
-                    \caps wants haves destination ->
-                        sshUploadPack command baseArguments remote caps wants haves destination
+                    \caps wants haves progress destination ->
+                        sshUploadPack command baseArguments remote caps wants haves progress destination
                 , transportUploadPackV2ToFile =
                     if attemptV2
                         then
                             Just
-                                ( \caps wants haves destination ->
-                                    sshUploadPackV2 command baseArguments remote caps wants haves destination
+                                ( \caps wants haves progress destination ->
+                                    sshUploadPackV2 command baseArguments remote caps wants haves progress destination
                                 )
                         else Nothing
                 , transportReceivePack =
@@ -521,16 +531,17 @@ sshUploadPack
     -> [ByteString]
     -> [ObjectId]
     -> [ObjectId]
+    -> FetchProgress
     -> FilePath
     -> IO ()
-sshUploadPack command arguments remote advertisedCapabilities wantedIds haves destination = do
+sshUploadPack command arguments remote advertisedCapabilities wantedIds haves progress destination = do
     (inputHandle, outputHandle, processHandle) <-
         sshStartProcess command arguments remote UploadPackService False
     _ <- readRefAdvertisementFromHandle outputHandle
     BS.hPut inputHandle (encodeWantRequest advertisedCapabilities wantedIds haves)
     hFlush inputHandle
     hClose inputHandle
-    writeUploadResponseFromHandle outputHandle destination
+    writeUploadResponseFromHandle progress outputHandle destination
     hClose outputHandle
     exitCode <- waitForProcess processHandle
     case exitCode of
@@ -547,9 +558,10 @@ sshUploadPackV2
     -> [ByteString]
     -> [ObjectId]
     -> [ObjectId]
+    -> FetchProgress
     -> FilePath
     -> IO ()
-sshUploadPackV2 command arguments remote _advertisedCapabilities wantedIds haves destination = do
+sshUploadPackV2 command arguments remote _advertisedCapabilities wantedIds haves progress destination = do
     (inputHandle, outputHandle, processHandle) <-
         sshStartProcess command arguments remote UploadPackService True
     let cleanup = do
@@ -565,7 +577,7 @@ sshUploadPackV2 command arguments remote _advertisedCapabilities wantedIds haves
                 BS.hPut inputHandle (encodeV2FetchRequest capabilities wantedIds haves)
                 hFlush inputHandle
                 hClose inputHandle
-                writeV2FetchResponseFromHandle outputHandle destination
+                writeV2FetchResponseFromHandle progress outputHandle destination
             VersionAdvertisementV0 payloads -> do
                 advertisement <-
                     case parseRefAdvertisement payloads of
@@ -576,7 +588,7 @@ sshUploadPackV2 command arguments remote _advertisedCapabilities wantedIds haves
                     (encodeWantRequest (discoveryCapabilities advertisement) wantedIds haves)
                 hFlush inputHandle
                 hClose inputHandle
-                writeUploadResponseFromHandle outputHandle destination
+                writeUploadResponseFromHandle progress outputHandle destination
         )
         `onException` cleanup
     hCloseIfOpen outputHandle
@@ -643,15 +655,15 @@ readRefAdvertisementFromHandle handle = go []
                     Right advertisement -> pure advertisement
             Right (DataPacket payload) -> go (payload : payloads)
 
-writeUploadResponseFromHandle :: Handle -> FilePath -> IO ()
-writeUploadResponseFromHandle handle destination =
-    writeUploadResponse (handleSource handle) destination
+writeUploadResponseFromHandle :: FetchProgress -> Handle -> FilePath -> IO ()
+writeUploadResponseFromHandle progress handle destination =
+    writeUploadResponse progress (handleSource handle) destination
 
 handleSource :: Handle -> ByteSource
 handleSource handle = ByteSource (BS.hGetSome handle 32768)
 
-writeUploadResponse :: ByteSource -> FilePath -> IO ()
-writeUploadResponse source destination =
+writeUploadResponse :: FetchProgress -> ByteSource -> FilePath -> IO ()
+writeUploadResponse progress source destination =
     withBinaryFile destination WriteMode $ \outputHandle -> do
         buffered <- newBufferedSource source
         loop buffered outputHandle
@@ -661,8 +673,13 @@ writeUploadResponse source destination =
         case prefix of
             Left err -> ioError (userError err)
             Right prefixBytes
-                | prefixBytes == BS8.pack "PACK" ->
-                    writeBuffered buffered outputHandle
+                | prefixBytes == BS8.pack "PACK" -> do
+                    pending <- readIORef (bufferedPending buffered)
+                    writeIORef (bufferedPending buffered) BS.empty
+                    BS.hPut outputHandle pending
+                    let initialBytes = fromIntegral (BS.length pending)
+                    fetchProgressBytes progress initialBytes
+                    copySourceWithProgress progress initialBytes (bufferedSource buffered) outputHandle
                 | otherwise ->
                     case parsePacketLength prefixBytes of
                         Nothing ->
@@ -765,6 +782,17 @@ copySource source outputHandle = do
             BS.hPut outputHandle chunk
             copySource source outputHandle
 
+copySourceWithProgress :: FetchProgress -> Integer -> ByteSource -> Handle -> IO ()
+copySourceWithProgress progress written source outputHandle = do
+    chunk <- sourceRead source
+    if BS.null chunk
+        then pure ()
+        else do
+            BS.hPut outputHandle chunk
+            let total = written + fromIntegral (BS.length chunk)
+            fetchProgressBytes progress total
+            copySourceWithProgress progress total source outputHandle
+
 parsePacketLength :: ByteString -> Maybe Int
 parsePacketLength bytes
     | BS.length bytes < 4 = Nothing
@@ -787,8 +815,8 @@ withGitTransport config remote action = do
                 { transportDiscovery =
                     \service -> gitDiscovery remote (attemptV2 && service == UploadPackService) service
                 , transportUploadPackToFile =
-                    \caps wants haves destination ->
-                        gitUploadPack remote caps wants haves destination
+                    \caps wants haves progress destination ->
+                        gitUploadPack remote caps wants haves progress destination
                 , transportUploadPackV2ToFile =
                     if attemptV2
                         then Just (gitUploadPackV2 remote)
@@ -826,14 +854,15 @@ gitUploadPack
     -> [ByteString]
     -> [ObjectId]
     -> [ObjectId]
+    -> FetchProgress
     -> FilePath
     -> IO ()
-gitUploadPack remote advertisedCapabilities wantedIds haves destination = do
+gitUploadPack remote advertisedCapabilities wantedIds haves progress destination = do
     handle <- gitConnect remote False UploadPackService
     _ <- readRefAdvertisementFromHandle handle
     BS.hPut handle (encodeWantRequest advertisedCapabilities wantedIds haves)
     hFlush handle
-    writeUploadResponseFromHandle handle destination
+    writeUploadResponseFromHandle progress handle destination
     hClose handle
 
 -- | The v2 fetch path over git://. A daemon that answered v2 during discovery
@@ -844,9 +873,10 @@ gitUploadPackV2
     -> [ByteString]
     -> [ObjectId]
     -> [ObjectId]
+    -> FetchProgress
     -> FilePath
     -> IO ()
-gitUploadPackV2 remote _advertisedCapabilities wantedIds haves destination =
+gitUploadPackV2 remote _advertisedCapabilities wantedIds haves progress destination =
     bracket
         (gitConnect remote True UploadPackService)
         hClose
@@ -856,7 +886,7 @@ gitUploadPackV2 remote _advertisedCapabilities wantedIds haves destination =
                 VersionAdvertisementV2 capabilities -> do
                     BS.hPut handle (encodeV2FetchRequest capabilities wantedIds haves)
                     hFlush handle
-                    writeV2FetchResponseFromHandle handle destination
+                    writeV2FetchResponseFromHandle progress handle destination
                 VersionAdvertisementV0 payloads -> do
                     advertisement <-
                         case parseRefAdvertisement payloads of
@@ -866,7 +896,7 @@ gitUploadPackV2 remote _advertisedCapabilities wantedIds haves destination =
                         handle
                         (encodeWantRequest (discoveryCapabilities advertisement) wantedIds haves)
                     hFlush handle
-                    writeUploadResponseFromHandle handle destination
+                    writeUploadResponseFromHandle progress handle destination
         )
 
 gitReceivePack :: RemoteUrl -> ByteString -> Maybe FilePath -> IO ByteString
@@ -1029,7 +1059,6 @@ httpV2Discovery
     -> [ByteString]
     -> IO DiscoveryAdvertisement
 httpV2Discovery config endpoint urlAuth capabilities = do
-    manager <- newManager tlsManagerSettings
     let objectFormat = v2ObjectFormat capabilities
         requestBody = encodeV2LsRefsRequest capabilities
     baseRequest <- parseRequest (uploadPackPath endpoint)
@@ -1098,7 +1127,7 @@ parseV2LsRefsPayloads objectFormat capabilities payloads =
     addLine result payload = do
         (caps, refs, symref, peeled) <- result
         case BS8.words (trimTrailingNewline payload) of
-            (word : refName : attributes)
+            (word : _refName : attributes)
                 | word == BS8.pack "unborn" ->
                     Right (caps ++ symrefAttribute attributes, refs, symrefTarget attributes, peeled)
             (objectIdText : refName : attributes) -> do
@@ -1159,9 +1188,10 @@ httpUploadPack
     -> [ByteString]
     -> [ObjectId]
     -> [ObjectId]
+    -> FetchProgress
     -> FilePath
     -> IO ()
-httpUploadPack manager config endpoint urlAuth advertisedCapabilities wantedIds haves destination = do
+httpUploadPack manager config endpoint urlAuth advertisedCapabilities wantedIds haves progress destination = do
     let path = uploadPackPath endpoint
         requestBody = BL.fromStrict (encodeWantRequest advertisedCapabilities wantedIds haves)
     baseRequest <- parseRequest path
@@ -1198,7 +1228,7 @@ httpUploadPack manager config endpoint urlAuth advertisedCapabilities wantedIds 
                 else
                     if status >= 200 && status < 300
                         then do
-                            writeUploadPackBody (responseBody response) destination
+                            writeUploadPackBody progress (responseBody response) destination
                             pure (Right ())
                         else pure (Left status)
 
@@ -1210,9 +1240,10 @@ httpUploadPackV2
     -> [ByteString]
     -> [ObjectId]
     -> [ObjectId]
+    -> FetchProgress
     -> FilePath
     -> IO ()
-httpUploadPackV2 manager config endpoint urlAuth advertisedCapabilities wantedIds haves destination = do
+httpUploadPackV2 manager config endpoint urlAuth advertisedCapabilities wantedIds haves progress destination = do
     let path = uploadPackPath endpoint
         requestBody =
             BL.fromStrict (encodeV2FetchRequest advertisedCapabilities wantedIds haves)
@@ -1224,7 +1255,7 @@ httpUploadPackV2 manager config endpoint urlAuth advertisedCapabilities wantedId
                 $ setRequestHeader (CI.mk (BS8.pack "Git-Protocol")) [BS8.pack "version=2"]
                 $ setRequestBodyLBS requestBody
                 $ applyRequestConfig config urlAuth baseRequest
-    firstAttempt <- withResponse request manager (writeV2Response destination)
+    firstAttempt <- withResponse request manager (writeV2Response progress destination)
     case firstAttempt of
         Right () -> pure ()
         Left status -> do
@@ -1234,7 +1265,7 @@ httpUploadPackV2 manager config endpoint urlAuth advertisedCapabilities wantedId
                     ioError (userError ("POST " ++ path ++ " failed with HTTP status " ++ show status))
                 Just (user, password) -> do
                     let authenticated = applyBasicAuth user password request
-                    retried <- withResponse authenticated manager (writeV2Response destination)
+                    retried <- withResponse authenticated manager (writeV2Response progress destination)
                     case retried of
                         Right () -> pure ()
                         Left retryStatus ->
@@ -1243,14 +1274,14 @@ httpUploadPackV2 manager config endpoint urlAuth advertisedCapabilities wantedId
                                     ("POST " ++ path ++ " failed with HTTP status " ++ show retryStatus)
                                 )
   where
-    writeV2Response targetPath response =
+    writeV2Response fetchProgress targetPath response =
         let status = getResponseStatusCode response
          in if status == 401
                 then pure (Left 401)
                 else
                     if status >= 200 && status < 300
                         then do
-                            writeV2FetchResponse (ByteSource (brRead (responseBody response))) targetPath
+                            writeV2FetchResponse fetchProgress (ByteSource (brRead (responseBody response))) targetPath
                             pure (Right ())
                         else pure (Left status)
 
@@ -1266,7 +1297,6 @@ encodeV2FetchRequest capabilities wantedIds haves =
                ]
             ++ [ encodeDelimPacketV2
                , encodePacketLineV2 (DataPacketV2 (BS8.pack "thin-pack\n"))
-               , encodePacketLineV2 (DataPacketV2 (BS8.pack "no-progress\n"))
                , encodePacketLineV2 (DataPacketV2 (BS8.pack "ofs-delta\n"))
                ]
             ++ [ encodePacketLineV2 (DataPacketV2 (BS8.pack ("want " ++ objectIdToHex objectId ++ "\n")))
@@ -1317,36 +1347,40 @@ readV2ResponsePacket buffered = do
                                 )
                             )
 
-writeV2FetchResponse :: ByteSource -> FilePath -> IO ()
-writeV2FetchResponse source destination =
+writeV2FetchResponse :: FetchProgress -> ByteSource -> FilePath -> IO ()
+writeV2FetchResponse progress source destination =
     withBinaryFile destination WriteMode $ \outputHandle -> do
         buffered <- newBufferedSource source
-        loop buffered outputHandle False
+        loop buffered outputHandle False 0
   where
-    loop buffered outputHandle inPack = do
+    loop buffered outputHandle inPack receivedBytes = do
         packet <- readV2ResponsePacket buffered
         case packet of
             Left err -> ioError (userError err)
             Right V2RawPack -> writeBuffered buffered outputHandle
             Right V2Flush ->
-                if inPack then pure () else loop buffered outputHandle inPack
-            Right V2Delim -> loop buffered outputHandle inPack
+                if inPack then pure () else loop buffered outputHandle inPack receivedBytes
+            Right V2Delim -> loop buffered outputHandle inPack receivedBytes
             Right V2End -> pure ()
             Right (V2Data payload)
                 | payload == BS8.pack "packfile\n" ->
-                    loop buffered outputHandle True
+                    loop buffered outputHandle True receivedBytes
                 | inPack ->
                     case BS.uncons payload of
                         Just (1, bytes) -> do
                             BS.hPut outputHandle bytes
-                            loop buffered outputHandle inPack
-                        Just (2, _) -> loop buffered outputHandle inPack
+                            let total = receivedBytes + fromIntegral (BS.length bytes)
+                            fetchProgressBytes progress total
+                            loop buffered outputHandle inPack total
+                        Just (2, message) -> do
+                            fetchProgressRemote progress message
+                            loop buffered outputHandle inPack receivedBytes
                         Just (3, message) ->
                             ioError (userError ("remote error: " ++ BS8.unpack message))
                         _ -> ioError (userError "unexpected sideband packet in protocol v2 fetch")
                 | payload == BS8.pack "acknowledgments\n" ->
-                    loop buffered outputHandle inPack
-                | otherwise -> loop buffered outputHandle inPack
+                    loop buffered outputHandle inPack receivedBytes
+                | otherwise -> loop buffered outputHandle inPack receivedBytes
 
 httpReceivePack
     :: Manager
@@ -1419,9 +1453,9 @@ readBodyReader reader = go []
             then pure (BS.concat (reverse chunks))
             else go (chunk : chunks)
 
-writeUploadPackBody :: BodyReader -> FilePath -> IO ()
-writeUploadPackBody reader destination =
-    writeUploadResponse (ByteSource (brRead reader)) destination
+writeUploadPackBody :: FetchProgress -> BodyReader -> FilePath -> IO ()
+writeUploadPackBody progress reader destination =
+    writeUploadResponse progress (ByteSource (brRead reader)) destination
 
 encodeWantRequest :: [ByteString] -> [ObjectId] -> [ObjectId] -> ByteString
 encodeWantRequest advertisedCapabilities wantedIds haves =
@@ -1456,19 +1490,6 @@ encodeWantRequest advertisedCapabilities wantedIds haves =
         | capability <- [BS8.pack "ofs-delta", BS8.pack "no-progress", BS8.pack "include-tag"]
         , capability `elem` advertisedCapabilities
         ]
-
-pktLineError :: ByteString -> Maybe String
-pktLineError bytes
-    | BS.length bytes < 4 = Nothing
-    | otherwise =
-        case readHex (BS8.unpack (BS.take 4 bytes)) of
-            [(packetLength, "")]
-                | packetLength >= 4 && packetLength <= BS.length bytes ->
-                    let payload = BS.take (packetLength - 4) (BS.drop 4 bytes)
-                     in if BS8.isPrefixOf (BS8.pack "ERR ") payload
-                            then Just (BS8.unpack (BS.drop 4 payload))
-                            else Nothing
-            _ -> Nothing
 
 getWithAuth
     :: Config

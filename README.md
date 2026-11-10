@@ -195,6 +195,19 @@ Push requires a fast-forward unless `--force` is used, and `--delete` removes
 a ref. `pull` is fetch followed by a merge; `pull --rebase` replays the local
 commits on top of the fetched head instead.
 
+### Progress
+
+`clone`, `fetch`, and `pull` draw git-style progress on stderr when stderr is
+a terminal: the server's sideband messages (`remote: Enumerating objects: ...`,
+`remote: Total ...`), one live line per phase with a spinner, bar, byte
+count/rate and an elapsed timer, and a short summary per phase
+(`Receiving objects`, `Resolving deltas`, `Updating files`) followed by
+`done in N.NNs`. `--progress` forces progress even when stderr is not a
+terminal, rendering plain final lines with no escape sequences; `--no-progress`
+disables it. The progress counters come from the pack header and the retention
+walk, so displaying them adds no extra pass over the pack. The same data is
+used by `scripts/optimization-benchmark.sh` for regression measurements.
+
 ## Branches and history
 
 ```console
@@ -244,10 +257,17 @@ answers with a streamed pack. The pack is spooled to a temporary file and
 checksummed. A self-contained pack is then indexed in a single streaming pass
 and retained directly under `.git/objects/pack`: delta bases are resolved
 through a temporary uncompressed object cache, so the clone path never writes,
-re-reads, and deletes every object as a loose file. Thin packs fall back to
-importing resolved objects as loose objects. Refs, the index, and the working
-tree are written from the retained pack; checkout and index generation share
-one payload read per file.
+re-reads, and deletes every object as a loose file. A thin pack is completed
+the way git's `index-pack --fix-thin` does: the missing delta bases are loaded
+from the local object store, appended to the pack and indexed with it, so
+fetch also keeps its "retained pack, zero loose objects" invariant. A pack
+that cannot be completed falls back to importing resolved objects as loose
+objects. Refs, the index, and the working tree are written from the retained
+pack; checkout and index generation share one payload read per file.
+
+The two optimization passes behind this pipeline are documented with their
+cost models, derivations, and measured figures in
+[docs/reflections.md](docs/reflections.md).
 
 ![Clone flow](docs/figures/clone-flow.png)
 
@@ -290,10 +310,11 @@ pack index tables are loaded in full.
 - SHA-1 and SHA-256 are supported. Object formats cannot be converted, and a
   dual-hash `compatObjectFormat` repository is refused.
 - Pack files are streamed, but a single object is held in memory while it is
-  read. Pack index tables are loaded in full. Thin packs are not converted
-  into retained packs; their loose objects are kept. Pack trailer checksums are
-  verified when a pack is retained, after every fetch, and by `verify`; opening
-  an existing object store does not re-hash whole packs.
+  read. Pack index tables are loaded in full. Thin packs whose missing bases
+  can be read from the local store are completed and retained; a thin pack
+  that cannot be completed falls back to loose objects. Pack trailer checksums
+  are verified when a pack is retained, after every fetch, and by `verify`;
+  opening an existing object store does not re-hash whole packs.
 - Submodules are initialised with `clone --recurse-submodules`,
   `submodule update --init [--recursive] [--remote]`, and `submodule sync`.
   `submodule add`, `deinit`, and branch-aware `--remote` updates are
@@ -335,4 +356,6 @@ large public repositories during release validation.
 `devenv shell -- unit-test` runs the same suite from the shell, and
 `devenv shell -- check` adds `cabal check`. `scripts/memory-benchmark.sh`
 builds a large packed repository and checks the peak memory of `clone` and
-`verify`. The GitHub Actions workflow runs the suite on GHC 9.6 and 9.10.
+`verify`; `scripts/optimization-benchmark.sh` generates a synthetic repository
+and reports clone/fetch wall times, pack counts, loose-object counts, and
+`git fsck` results for a before/after comparison. The GitHub Actions workflow runs the suite on GHC 9.6 and 9.10.

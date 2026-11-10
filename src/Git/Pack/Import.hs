@@ -30,14 +30,21 @@ import Git.Repo (Repository)
 -- written as soon as their delta base is available; only unresolved reference
 -- deltas stay in memory. The pack trailer is verified before anything is
 -- written.
-importPackFile :: HashAlgorithm -> Repository -> FilePath -> IO ()
-importPackFile objectFormat repository packPath = do
+importPackFile
+    :: HashAlgorithm
+    -> Repository
+    -> FilePath
+    -> (Int -> Int -> IO ())
+    -> IO ()
+importPackFile objectFormat repository packPath reportObjects = do
     validatePackFile objectFormat packPath
     header <- readPackHeaderFromFile packPath
     let objectCount = packHeaderObjectCount header
+    reportObjects 0 objectCount
     withBinaryFile packPath ReadMode $ \handle -> do
         state <- consumeEntries handle objectCount 12 (ImportState Map.empty [])
         resolvePending state
+    reportObjects objectCount objectCount
   where
     consumeEntries handle remaining offset state
         | remaining <= 0 = pure state

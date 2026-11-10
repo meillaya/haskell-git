@@ -18,6 +18,7 @@ result-*
 
 # Local scratch state for agent sessions
 .dsh/
+__pycache__/
 
 # Editor and OS metadata
 .idea/

@@ -3,20 +3,28 @@ module Git.Pack.Retain
     , retainPackFile
     ) where
 
-import Control.Exception (evaluate, finally)
-import Control.Monad (foldM, unless, when)
+import Control.Exception (IOException, bracket, evaluate, finally, try)
+import Control.Monad (foldM, forM, unless, when)
+import qualified Codec.Compression.Zlib as Zlib
+import qualified Crypto.Hash.SHA1 as SHA1
+import qualified Crypto.Hash.SHA256 as SHA256
 import Data.Array (Array, accumArray, elems, listArray, (!))
-import Data.Bits ((.&.), complement, shiftR, xor)
+import Data.Bits ((.&.), (.|.), complement, shiftL, shiftR, xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
+import qualified Data.ByteString.Lazy as BL
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
-import Data.Word (Word32, Word64)
+import Data.Maybe (catMaybes)
+import Data.Word (Word32, Word64, Word8)
 import System.Directory
     ( copyFile
     , createDirectoryIfMissing
     , doesFileExist
+    , getFileSize
     , removeFile
+    , renameFile
     )
 import System.FilePath ((</>))
 import System.IO
@@ -30,7 +38,7 @@ import System.IO
     , withBinaryFile
     )
 import Git.Hash
-    ( HashAlgorithm
+    ( HashAlgorithm (..)
     , ObjectId
     , hashBytesFor
     , hashSize
@@ -61,6 +69,7 @@ import Git.Pack.Stream
     , validatePackFile
     )
 import Git.Repo (Repository, repositoryObjectsDir)
+import Git.Store (Store, loadStore, readObjectOrFail)
 
 data RetainedObject = RetainedObject
     { retainedObjectId :: ObjectId
@@ -316,11 +325,17 @@ encodeWord64 value =
 -- uncompressed makes delta resolution cheap; the file is deleted when the
 -- retention attempt finishes.
 data CachedObject = CachedObject
-    { cachedRetained :: RetainedObject
-    , cachedPayloadOffset :: Int
+    { cachedPayloadOffset :: Int
     , cachedPayloadLength :: Int
     , cachedObjectType :: GitObjectType
     }
+
+-- | A delta entry that is still waiting for its base object. An offset delta
+-- can wait for its base only when the base entry itself was deferred (for
+-- example a thin pack whose delta chain is rooted at an external object).
+data PendingObject
+    = PendingRefDelta Int Word32 ObjectId ByteString
+    | PendingOffsetDelta Int Word32 Int ByteString
 
 data DirectRetention = DirectRetention
     { directObjectFormat :: HashAlgorithm
@@ -329,28 +344,62 @@ data DirectRetention = DirectRetention
     , directOffsetMap :: Map.Map Int CachedObject
     , directObjectMap :: Map.Map ObjectId CachedObject
     , directIndexEntries :: [RetainedObject]
-    , directPending :: [(Int, Word32, ObjectId, ByteString)]
+    , directPending :: [PendingObject]
+    , directDeltaCount :: Int
+    -- | Full objects read from the local repository to complete a thin pack,
+    -- newest first. They are appended to the completed pack in reverse order.
+    , directAppendedBases :: [GitObject]
     }
 
--- | Retain a self-contained pack by walking it once, resolving deltas through a
--- temporary uncompressed object cache, and writing the pack plus a v2 index.
--- No loose objects are written, which removes the write/read/delete cycle that
--- dominated clone time for large packs. Returns False when the pack is thin or
--- otherwise cannot be retained this way; the caller must then fall back to
--- 'importPackFile' and 'retainPackFile'.
-retainPackDirectly :: HashAlgorithm -> Repository -> FilePath -> IO Bool
-retainPackDirectly objectFormat repository packPath = do
+-- | Incremental pack checksum, matching the object format of the repository.
+data PackHasher
+    = Sha1Hasher SHA1.Ctx
+    | Sha256Hasher SHA256.Ctx
+
+newPackHasher :: HashAlgorithm -> PackHasher
+newPackHasher Sha1 = Sha1Hasher SHA1.init
+newPackHasher Sha256 = Sha256Hasher SHA256.init
+
+updatePackHasher :: PackHasher -> ByteString -> PackHasher
+updatePackHasher (Sha1Hasher context) bytes = Sha1Hasher (SHA1.update context bytes)
+updatePackHasher (Sha256Hasher context) bytes = Sha256Hasher (SHA256.update context bytes)
+
+finalizePackHasher :: PackHasher -> ByteString
+finalizePackHasher (Sha1Hasher context) = SHA1.finalize context
+finalizePackHasher (Sha256Hasher context) = SHA256.finalize context
+
+-- | Retain a pack by walking it once, resolving deltas through a temporary
+-- uncompressed object cache, and writing the pack plus a v2 index. No loose
+-- objects are written, which removes the write/read/delete cycle that dominated
+-- clone time for large packs.
+--
+-- A thin pack (one whose reference deltas point at objects outside the pack) is
+-- completed in the style of @git index-pack --fix-thin@: the missing base
+-- objects are read from the local repository store, appended to a copy of the
+-- pack as full objects, and the pack header and trailer are rewritten. The
+-- report callbacks receive object progress @(done, total)@ and the number of
+-- resolved deltas once at the end. Returns False when the pack cannot be
+-- retained this way (for example a base object is missing from the store); the
+-- caller must then fall back to 'importPackFile' and 'retainPackFile'.
+retainPackDirectly
+    :: HashAlgorithm
+    -> Repository
+    -> FilePath
+    -> (Int -> Int -> IO ())
+    -> (Int -> Int -> IO ())
+    -> IO Bool
+retainPackDirectly objectFormat repository packPath reportObjects reportDeltas = do
     validatePackFile objectFormat packPath
     header <- readPackHeaderFromFile packPath
     let objectCount = packHeaderObjectCount header
     if objectCount <= 0
-        then pure False
+        then do
+            reportObjects 0 0
+            pure False
         else do
+            reportObjects 0 objectCount
             packHash <- readPackHash objectFormat packPath
             let packDirectory = repositoryObjectsDir repository </> "pack"
-                packName = "pack-" ++ objectIdToHex packHash
-                destinationPack = packDirectory </> packName ++ ".pack"
-                destinationIndex = packDirectory </> packName ++ ".idx"
             createDirectoryIfMissing True packDirectory
             (cachePath, cacheHandle) <-
                 openTempFile packDirectory "tmp-haskell-git-direct-cache"
@@ -358,52 +407,63 @@ retainPackDirectly objectFormat repository packPath = do
                     hClose cacheHandle
                     exists <- doesFileExist cachePath
                     when exists (removeFile cachePath)
+                initialState =
+                    DirectRetention
+                        { directObjectFormat = objectFormat
+                        , directCacheHandle = cacheHandle
+                        , directCacheSize = 0
+                        , directOffsetMap = Map.empty
+                        , directObjectMap = Map.empty
+                        , directIndexEntries = []
+                        , directPending = []
+                        , directDeltaCount = 0
+                        , directAppendedBases = []
+                        }
             outcome <-
                 ( do
-                    retained <-
-                        do
-                            let initialState =
-                                    DirectRetention
-                                        { directObjectFormat = objectFormat
-                                        , directCacheHandle = cacheHandle
-                                        , directCacheSize = 0
-                                        , directOffsetMap = Map.empty
-                                        , directObjectMap = Map.empty
-                                        , directIndexEntries = []
-                                        , directPending = []
-                                        }
-                            walked <-
-                                withBinaryFile packPath ReadMode $ \packHandle ->
-                                    consumeDirectEntries packHandle objectCount 12 initialState
-                            resolveDirectPending walked
-                    case retained of
-                        Nothing -> pure False
-                        Just finalState -> do
-                            let entries = reverse (directIndexEntries finalState)
-                                indexBytes = buildPackIndex objectFormat entries packHash
-                            case parsePackIndexFor objectFormat indexBytes of
-                                Left err ->
-                                    ioError (userError ("generated pack index is invalid: " ++ err))
-                                Right _ -> do
-                                    copyIfMissing packPath destinationPack
-                                    indexExists <- doesFileExist destinationIndex
-                                    unless indexExists (BS.writeFile destinationIndex indexBytes)
+                    walked <-
+                        withBinaryFile packPath ReadMode $ \packHandle ->
+                            consumeDirectEntries reportObjects packHandle objectCount objectCount 12 initialState
+                    (resolved, remaining) <- resolveDirectPendingRounds walked
+                    if null remaining
+                        then do
+                            installRetainedPack
+                                objectFormat
+                                repository
+                                (reverse (directIndexEntries resolved))
+                                packHash
+                                packPath
+                            reportObjects objectCount objectCount
+                            reportDeltas (directDeltaCount resolved) (directDeltaCount resolved)
+                            pure True
+                        else do
+                            completed <-
+                                completeThinPack
+                                    objectFormat
+                                    repository
+                                    packPath
+                                    packDirectory
+                                    objectCount
+                                    reportObjects
+                                    resolved
+                                    remaining
+                            case completed of
+                                Nothing -> pure False
+                                Just final -> do
+                                    reportDeltas (directDeltaCount final) (directDeltaCount final)
                                     pure True
-                )
-                    `finally` cleanupCache
+                ) `finally` cleanupCache
             pure outcome
-  where
-    copyIfMissing source destination = do
-        exists <- doesFileExist destination
-        when (not exists) (copyFile source destination)
 
 consumeDirectEntries
-    :: Handle
+    :: (Int -> Int -> IO ())
+    -> Handle
+    -> Int
     -> Int
     -> Int
     -> DirectRetention
     -> IO DirectRetention
-consumeDirectEntries packHandle remaining offset state
+consumeDirectEntries reportObjects packHandle objectCount remaining offset state
     | remaining <= 0 = pure state
     | otherwise = do
         (rawObject, consumed) <-
@@ -411,7 +471,16 @@ consumeDirectEntries packHandle remaining offset state
                 =<< readPackObjectAtHandle (directObjectFormat state) packHandle offset
         crc <- entryCrc packHandle offset consumed
         nextState <- rememberDirectObject packHandle offset crc rawObject state
-        consumeDirectEntries packHandle (remaining - 1) (offset + consumed) nextState
+        let walked = objectCount - remaining + 1
+        when (walked `rem` directProgressInterval == 0) $
+            reportObjects walked objectCount
+        consumeDirectEntries
+            reportObjects
+            packHandle
+            objectCount
+            (remaining - 1)
+            (offset + consumed)
+            nextState
 
 rememberDirectObject
     :: Handle
@@ -426,27 +495,33 @@ rememberDirectObject _packHandle offset crc rawObject state =
             appendDirectObject state offset crc (objectKindType objectKind) payload
         PackRawOffsetDelta baseDistance delta ->
             case Map.lookup (offset - baseDistance) (directOffsetMap state) of
-                Nothing ->
-                    ioError
-                        ( userError
-                            ( "pack delta base is not available at offset "
-                                ++ show (offset - baseDistance)
-                            )
-                        )
                 Just base -> do
                     basePayload <- readCachedPayload state base
-                    applyWithBase state offset crc base basePayload delta
+                    let counted = countDelta state
+                    applyWithBase counted offset crc base basePayload delta
+                Nothing ->
+                    let counted = countDelta state
+                     in pure
+                            counted
+                                { directPending =
+                                    PendingOffsetDelta offset crc (offset - baseDistance) delta
+                                        : directPending counted
+                                }
         PackRawRefDelta baseObjectId delta ->
             case Map.lookup baseObjectId (directObjectMap state) of
                 Just base -> do
                     basePayload <- readCachedPayload state base
-                    applyWithBase state offset crc base basePayload delta
+                    let counted = countDelta state
+                    applyWithBase counted offset crc base basePayload delta
                 Nothing ->
-                    pure
-                        state
-                            { directPending =
-                                (offset, crc, baseObjectId, delta) : directPending state
-                            }
+                    let counted = countDelta state
+                     in pure
+                            counted
+                                { directPending =
+                                    PendingRefDelta offset crc baseObjectId delta : directPending counted
+                                }
+  where
+    countDelta current = current {directDeltaCount = directDeltaCount current + 1}
 
 objectKindType :: PackObjectKind -> GitObjectType
 objectKindType objectKind =
@@ -486,8 +561,7 @@ appendDirectObject state offset crc objectType payload = do
     let retained = RetainedObject objectId offset crc
         cached =
             CachedObject
-                { cachedRetained = retained
-                , cachedPayloadOffset = cacheOffset
+                { cachedPayloadOffset = cacheOffset
                 , cachedPayloadLength = BS.length payload
                 , cachedObjectType = objectType
                 }
@@ -509,21 +583,355 @@ readCachedPayload state cached = do
         then ioError (userError "direct pack retention: object cache is truncated")
         else pure payload
 
-resolveDirectPending :: DirectRetention -> IO (Maybe DirectRetention)
-resolveDirectPending state = go (directPending state) (state {directPending = []})
+-- | Resolve pending reference deltas in rounds, since a delta can be the base
+-- of another delta that appears earlier in the pack. The returned list is the
+-- set of still-unresolved deltas; an empty list means the pack was fully
+-- resolved from its own objects.
+resolveDirectPendingRounds :: DirectRetention -> IO (DirectRetention, [PendingObject])
+resolveDirectPendingRounds state = go (directPending state) (state {directPending = []})
   where
     go pending current
-        | null pending = pure (Just current)
+        | null pending = pure (current, [])
         | otherwise = do
             (next, remaining) <- foldM step (current, []) pending
             if length remaining == length pending
-                then pure Nothing
+                then pure (next, remaining)
                 else go remaining next
-    step (current, remaining) (offset, crc, baseObjectId, delta) =
-        case Map.lookup baseObjectId (directObjectMap current) of
-            Nothing ->
-                pure (current, remaining ++ [(offset, crc, baseObjectId, delta)])
-            Just base -> do
-                basePayload <- readCachedPayload current base
-                current' <- applyWithBase current offset crc base basePayload delta
-                pure (current', remaining)
+    step (current, remaining) pendingObject =
+        case pendingObject of
+            PendingRefDelta offset crc baseObjectId delta ->
+                case Map.lookup baseObjectId (directObjectMap current) of
+                    Nothing -> pure (current, remaining ++ [pendingObject])
+                    Just base -> do
+                        basePayload <- readCachedPayload current base
+                        current' <- applyWithBase current offset crc base basePayload delta
+                        pure (current', remaining)
+            PendingOffsetDelta offset crc baseOffset delta ->
+                case Map.lookup baseOffset (directOffsetMap current) of
+                    Nothing -> pure (current, remaining ++ [pendingObject])
+                    Just base -> do
+                        basePayload <- readCachedPayload current base
+                        current' <- applyWithBase current offset crc base basePayload delta
+                        pure (current', remaining)
+
+-- | Complete a thin pack by loading the missing base objects from the local
+-- repository store and appending them to a copy of the pack. Returns Nothing
+-- (so the caller falls back to the loose import path) if a base is missing or
+-- anything goes wrong; no completed pack or index is left behind in that case.
+completeThinPack
+    :: HashAlgorithm
+    -> Repository
+    -> FilePath
+    -> FilePath
+    -> Int
+    -> (Int -> Int -> IO ())
+    -> DirectRetention
+    -> [PendingObject]
+    -> IO (Maybe DirectRetention)
+completeThinPack objectFormat repository packPath packDirectory objectCount reportObjects stalled remaining = do
+    attempt <- try run :: IO (Either IOException (Maybe DirectRetention))
+    pure (either (const Nothing) id attempt)
+  where
+    run = do
+        resolved <- resolvePendingWithStore objectFormat repository stalled remaining
+        case resolved of
+            Nothing -> pure Nothing
+            Just final -> do
+                let appended = appendedBasesToWrite objectFormat final
+                    finalTotal = objectCount + length appended
+                reportObjects objectCount finalTotal
+                bracket
+                    (openTempFile packDirectory "tmp-haskell-git-completed-pack")
+                    cleanupCompletedTemp
+                    (\(completedPath, completedHandle) -> do
+                        (appendedEntries, newPackHash) <-
+                            writeCompletedPack
+                                objectFormat
+                                packPath
+                                completedHandle
+                                objectCount
+                                appended
+                        hClose completedHandle
+                        let entries = reverse (directIndexEntries final) ++ appendedEntries
+                            indexBytes = buildPackIndex objectFormat entries newPackHash
+                        case parsePackIndexFor objectFormat indexBytes of
+                            Left _ -> pure Nothing
+                            Right _ -> do
+                                installCompletedPack
+                                    objectFormat
+                                    repository
+                                    entries
+                                    newPackHash
+                                    completedPath
+                                reportObjects finalTotal finalTotal
+                                pure (Just final)
+                    )
+
+cleanupCompletedTemp :: (FilePath, Handle) -> IO ()
+cleanupCompletedTemp (completedPath, completedHandle) = do
+    _ <- try (hClose completedHandle) :: IO (Either IOException ())
+    exists <- doesFileExist completedPath
+    when exists (removeFile completedPath)
+
+-- | The bases to append to the completed pack, in append order. A base that
+-- the thin pack can already reconstruct itself is dropped: appending it would
+-- index the same object id twice. Dropping it is safe because the object is
+-- already present in the pack body with identical content.
+appendedBasesToWrite :: HashAlgorithm -> DirectRetention -> [GitObject]
+appendedBasesToWrite objectFormat final = go Map.empty (reverse (directAppendedBases final))
+  where
+    packedIds =
+        Map.fromList
+            [ (retainedObjectId entry, ())
+            | entry <- directIndexEntries final
+            ]
+    go _ [] = []
+    go seen (gitObjectValue : rest)
+        | Map.member objectId packedIds = go seen rest
+        | Map.member objectId seen = go seen rest
+        | otherwise = gitObjectValue : go (Map.insert objectId () seen) rest
+      where
+        objectId = objectIdForObjectFor objectFormat gitObjectValue
+
+-- | Resolve the pending reference deltas that a thin pack inherited from the
+-- clone/fetch it belongs to. Bases are read from the local repository, which
+-- covers both loose objects and objects from earlier retained packs. A base
+-- that cannot be read makes the whole completion fail cleanly.
+resolvePendingWithStore
+    :: HashAlgorithm
+    -> Repository
+    -> DirectRetention
+    -> [PendingObject]
+    -> IO (Maybe DirectRetention)
+resolvePendingWithStore objectFormat repository stalled remaining = do
+    loadedStore <- try (loadStore repository) :: IO (Either IOException Store)
+    case loadedStore of
+        Left _ -> pure Nothing
+        Right store -> go (stalled {directPending = remaining}) store
+  where
+    go current store = do
+        (resolved, unresolved) <- resolveDirectPendingRounds current
+        if null unresolved
+            then pure (Just resolved)
+            else do
+                let candidateIds =
+                        stableUnique
+                            [ baseObjectId
+                            | PendingRefDelta _ _ baseObjectId _ <- unresolved
+                            , Map.notMember baseObjectId (directObjectMap resolved)
+                            ]
+                bases <- catMaybes <$> forM candidateIds (loadBase store)
+                if null bases
+                    then pure Nothing
+                    else do
+                        next <- foldM appendExternalBase resolved bases
+                        go (next {directPending = unresolved}) store
+
+    loadBase store objectId = do
+        attempt <- try (readObjectOrFail store objectId) :: IO (Either IOException GitObject)
+        case attempt of
+            Left _ -> pure Nothing
+            Right gitObjectValue
+                | objectIdForObjectFor objectFormat gitObjectValue == objectId ->
+                    pure (Just (objectId, gitObjectValue))
+                | otherwise -> pure Nothing
+
+stableUnique :: [ObjectId] -> [ObjectId]
+stableUnique = Map.keys . Map.fromList . map (\objectId -> (objectId, ()))
+
+appendExternalBase :: DirectRetention -> (ObjectId, GitObject) -> IO DirectRetention
+appendExternalBase state (objectId, gitObjectValue) = do
+    let payload = gitObjectPayload gitObjectValue
+        cacheOffset = directCacheSize state
+        cached =
+            CachedObject
+                { cachedPayloadOffset = cacheOffset
+                , cachedPayloadLength = BS.length payload
+                , cachedObjectType = gitObjectType gitObjectValue
+                }
+    hSeek (directCacheHandle state) AbsoluteSeek (fromIntegral cacheOffset)
+    BS.hPut (directCacheHandle state) payload
+    pure
+        state
+            { directCacheSize = cacheOffset + BS.length payload
+            , directObjectMap = Map.insert objectId cached (directObjectMap state)
+            , directAppendedBases = gitObjectValue : directAppendedBases state
+            }
+
+-- | Write the completed pack: a v2 header with the larger object count, a
+-- streamed copy of the original body (whose entry offsets do not change because
+-- the header length does not change), the appended base objects, and the
+-- checksum trailer. Returns the appended entries' index records and the hash of
+-- the completed pack.
+writeCompletedPack
+    :: HashAlgorithm
+    -> FilePath
+    -> Handle
+    -> Int
+    -> [GitObject]
+    -> IO ([RetainedObject], ObjectId)
+writeCompletedPack objectFormat originalPackPath completedHandle objectCount appendedBases = do
+    originalSize <- getFileSize originalPackPath
+    let hashLength = hashSize objectFormat
+        bodyLength = fromIntegral (originalSize - fromIntegral (directPackHeaderLength + hashLength))
+        headerBytes =
+            BS8.pack "PACK"
+                <> encodeWord32 2
+                <> encodeWord32 (fromIntegral (objectCount + length appendedBases))
+        firstAppendedOffset = directPackHeaderLength + bodyLength
+    BS.hPut completedHandle headerBytes
+    bodyHasher <-
+        copyPackBody
+            objectFormat
+            originalPackPath
+            completedHandle
+            (updatePackHasher (newPackHasher objectFormat) headerBytes)
+            (fromIntegral bodyLength)
+    (finalHasher, appendedEntries, _) <-
+        foldM
+            (writeAppendedBase objectFormat completedHandle)
+            (bodyHasher, [], firstAppendedOffset)
+            appendedBases
+    let trailer = finalizePackHasher finalHasher
+    BS.hPut completedHandle trailer
+    newPackHash <-
+        maybe
+            (ioError (userError "completed pack trailer is not a valid object id"))
+            pure
+            (objectIdFromBytesFor objectFormat trailer)
+    pure (appendedEntries, newPackHash)
+
+copyPackBody
+    :: HashAlgorithm
+    -> FilePath
+    -> Handle
+    -> PackHasher
+    -> Integer
+    -> IO PackHasher
+copyPackBody _objectFormat originalPackPath outputHandle initialHasher bodyLength =
+    withBinaryFile originalPackPath ReadMode $ \inputHandle -> do
+        hSeek inputHandle AbsoluteSeek (fromIntegral directPackHeaderLength)
+        go inputHandle initialHasher bodyLength
+  where
+    go inputHandle hasher remaining
+        | remaining <= 0 = pure hasher
+        | otherwise = do
+            let chunkSize = fromIntegral (min remaining packCopyChunkSize)
+            chunk <- BS.hGet inputHandle chunkSize
+            if BS.null chunk
+                then ioError (userError "direct pack retention: original pack body is truncated")
+                else do
+                    BS.hPut outputHandle chunk
+                    go
+                        inputHandle
+                        (updatePackHasher hasher chunk)
+                        (remaining - fromIntegral (BS.length chunk))
+
+writeAppendedBase
+    :: HashAlgorithm
+    -> Handle
+    -> (PackHasher, [RetainedObject], Int)
+    -> GitObject
+    -> IO (PackHasher, [RetainedObject], Int)
+writeAppendedBase objectFormat outputHandle (hasher, entries, offset) gitObjectValue = do
+    let payload = gitObjectPayload gitObjectValue
+        entry =
+            objectHeader (gitObjectType gitObjectValue) (BS.length payload)
+                <> BL.toStrict (Zlib.compress (BL.fromStrict payload))
+        retained =
+            RetainedObject
+                { retainedObjectId =
+                    objectIdForPayloadFor objectFormat (gitObjectType gitObjectValue) payload
+                , retainedOffset = offset
+                , retainedCrc = crc32 entry
+                }
+    BS.hPut outputHandle entry
+    pure
+        ( updatePackHasher hasher entry
+        , retained : entries
+        , offset + BS.length entry
+        )
+
+objectHeader :: GitObjectType -> Int -> ByteString
+objectHeader objectType payloadSize =
+    encodeObjectSize (objectKindCode objectType) payloadSize
+
+objectKindCode :: GitObjectType -> Word8
+objectKindCode BlobObject = 3
+objectKindCode TreeObject = 2
+objectKindCode CommitObject = 1
+objectKindCode TagObject = 4
+
+-- | Encode the pack entry header (kind and uncompressed size) the way git
+-- does: a 4-bit kind followed by a little-endian variable length size.
+encodeObjectSize :: Word8 -> Int -> ByteString
+encodeObjectSize kindCodeValue size =
+    case go (size `shiftR` 4) [] of
+        [] -> BS.singleton firstByte
+        restBytes -> BS.pack (firstByte : restBytes)
+  where
+    firstByte =
+        (kindCodeValue `shiftL` 4)
+            .|. fromIntegral (size .&. 0x0f)
+            .|. (if size `shiftR` 4 == 0 then 0 else 0x80)
+    go 0 accumulated = reverse accumulated
+    go remaining accumulated =
+        let byte = fromIntegral (remaining .&. 0x7f)
+            rest = remaining `shiftR` 7
+         in go rest ((byte .|. (if rest == 0 then 0 else 0x80)) : accumulated)
+
+installRetainedPack
+    :: HashAlgorithm
+    -> Repository
+    -> [RetainedObject]
+    -> ObjectId
+    -> FilePath
+    -> IO ()
+installRetainedPack objectFormat repository entries packHash sourcePack = do
+    let packDirectory = repositoryObjectsDir repository </> "pack"
+        packName = "pack-" ++ objectIdToHex packHash
+        destinationPack = packDirectory </> packName ++ ".pack"
+        destinationIndex = packDirectory </> packName ++ ".idx"
+        indexBytes = buildPackIndex objectFormat entries packHash
+    createDirectoryIfMissing True packDirectory
+    case parsePackIndexFor objectFormat indexBytes of
+        Left err -> ioError (userError ("generated pack index is invalid: " ++ err))
+        Right _ -> do
+            copyIfMissing sourcePack destinationPack
+            indexExists <- doesFileExist destinationIndex
+            unless indexExists (BS.writeFile destinationIndex indexBytes)
+  where
+    copyIfMissing source destination = do
+        exists <- doesFileExist destination
+        when (not exists) (copyFile source destination)
+
+installCompletedPack
+    :: HashAlgorithm
+    -> Repository
+    -> [RetainedObject]
+    -> ObjectId
+    -> FilePath
+    -> IO ()
+installCompletedPack objectFormat repository entries packHash completedPath = do
+    let packDirectory = repositoryObjectsDir repository </> "pack"
+        packName = "pack-" ++ objectIdToHex packHash
+        destinationPack = packDirectory </> packName ++ ".pack"
+        destinationIndex = packDirectory </> packName ++ ".idx"
+        indexBytes = buildPackIndex objectFormat entries packHash
+    createDirectoryIfMissing True packDirectory
+    case parsePackIndexFor objectFormat indexBytes of
+        Left err -> ioError (userError ("generated pack index is invalid: " ++ err))
+        Right _ -> do
+            packExists <- doesFileExist destinationPack
+            unless packExists (renameFile completedPath destinationPack)
+            indexExists <- doesFileExist destinationIndex
+            unless indexExists (BS.writeFile destinationIndex indexBytes)
+
+directPackHeaderLength :: Int
+directPackHeaderLength = 12
+
+directProgressInterval :: Int
+directProgressInterval = 16
+
+packCopyChunkSize :: Integer
+packCopyChunkSize = 64 * 1024

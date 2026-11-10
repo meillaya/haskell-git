@@ -16,6 +16,8 @@ import qualified Git.Pack.IndexSpec as PackIndexSpec
 import qualified Git.Pack.ReadSpec as PackReadSpec
 import qualified Git.Pack.StreamingSpec as PackStreamingSpec
 import qualified Git.PackSpec as PackSpec
+import qualified Git.Pack.RetainSpec as PackRetainSpec
+import qualified Git.ProgressSpec as ProgressSpec
 import qualified Git.PropertySpec as PropertySpec
 import qualified Git.Protocol.PacketLineSpec as PacketLineSpec
 import qualified Git.Protocol.SmartHTTPSpec as SmartHTTPSpec
@@ -44,8 +46,10 @@ main = do
     DeltaSpec.run
     PackIndexSpec.run
     PackReadSpec.run
+    PackRetainSpec.run
     PackStreamingSpec.run
     PropertySpec.run
+    ProgressSpec.run
     IndexSpec.run
     StoreSpec.run
     SmartHTTPSpec.run

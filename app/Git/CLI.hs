@@ -19,7 +19,7 @@ import Data.Time.LocalTime
     , minutesToTimeZone
     , utcToZonedTime
     )
-import Git.Clone (CloneResult (..), cloneRepository)
+import Git.Clone (CloneResult (..), cloneRepository, cloneRepositoryWithProgress)
 import Git.Commit (commitCurrentIndex)
 import Git.Config
     ( configEntries
@@ -33,6 +33,7 @@ import Git.Fetch
     , FetchResult (..)
     , defaultFetchOptions
     , fetchRepository
+    , fetchRepositoryWithProgress
     )
 import Git.Hash (HashAlgorithm (..), ObjectId, defaultHashAlgorithm, objectIdToHex)
 import Git.Index
@@ -81,7 +82,13 @@ import Git.Object.Tree
     , renderTreeEntry
     , treeFromObjectFor
     )
-import Git.Pull (pullRepository, pullRepositoryRebase, pullRepositoryWith)
+import Git.Progress (Progress, newProgress)
+import Git.Pull
+    ( pullRepository
+    , pullRepositoryRebaseWithProgress
+    , pullRepositoryWith
+    , pullRepositoryWithProgress
+    )
 import Git.Rebase
     ( RebaseResult (..)
     , rebaseAbort
@@ -148,7 +155,7 @@ import System.Directory
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (ExitCode (ExitFailure), exitWith)
 import System.FilePath ((</>), makeRelative)
-import System.IO (hPutStrLn, stderr, stdout)
+import System.IO (hIsTerminalDevice, hPutStrLn, stderr, stdout)
 import System.IO.Error (ioeGetErrorString)
 import Text.Read (readMaybe)
 
@@ -166,6 +173,17 @@ reportFailure err = do
     hPutStrLn stderr ("haskell-git: " ++ ioeGetErrorString err)
     exitWith (ExitFailure 1)
 
+-- | Progress is on by default when stderr is a terminal; --progress and
+-- --no-progress override that.
+withProgress :: Maybe Bool -> (Progress -> IO a) -> IO a
+withProgress configured action = do
+    enabled <-
+        case configured of
+            Just value -> pure value
+            Nothing -> hIsTerminalDevice stderr
+    progress <- newProgress enabled
+    action progress
+
 data Command
     = InitCommand InitOptions
     | AddCommand [FilePath]
@@ -177,8 +195,8 @@ data Command
     | WriteTreeCommand
     | CommitTreeCommand String [String] String
     | UpdateRefCommand String String
-    | CloneCommand Bool String (Maybe FilePath)
-    | FetchCommand String [String] FetchOptions
+    | CloneCommand Bool String (Maybe FilePath) (Maybe Bool)
+    | FetchCommand String [String] FetchOptions (Maybe Bool)
     | PushCommand String [String] PushOptions
     | CheckoutCommand (Maybe String) String
     | SwitchCommand String
@@ -187,9 +205,9 @@ data Command
     | ResetCommand String
     | MergeCommand MergeAction
     | CommitCommand String
-    | PullCommand String FetchOptions
-    | PullRebaseCommand String
-    | PullFFOnlyCommand String
+    | PullCommand String FetchOptions (Maybe Bool)
+    | PullRebaseCommand String (Maybe Bool)
+    | PullFFOnlyCommand String (Maybe Bool)
     | RebaseCommand RebaseAction
     | SubmoduleCommand SubmoduleAction
     | RemoteCommand RemoteAction
@@ -264,8 +282,7 @@ parseCommand ["write-tree"] = Right WriteTreeCommand
 parseCommand ("commit-tree":rest) = parseCommitTree rest
 parseCommand ("update-ref":[refPath, revision]) =
     Right (UpdateRefCommand refPath revision)
-parseCommand ("clone":"--recurse-submodules":rest) = parseClone True rest
-parseCommand ("clone":rest) = parseClone False rest
+parseCommand ("clone":rest) = parseClone rest
 parseCommand ("fetch":rest) = parseFetch rest
 parseCommand ("push":rest) = parsePush rest
 parseCommand ("checkout":rest) = parseCheckout rest
@@ -324,8 +341,8 @@ parseFetch :: [String] -> Either String Command
 parseFetch arguments = do
     (options, positionals) <- go defaultFetchOptions [] arguments
     case positionals of
-        [] -> Right (FetchCommand "origin" [] options)
-        remote : refspecs -> Right (FetchCommand remote refspecs options)
+        [] -> Right (FetchCommand "origin" [] options (fetchProgressMode options))
+        remote : refspecs -> Right (FetchCommand remote refspecs options (fetchProgressMode options))
   where
     go options positionals [] = Right (options, reverse positionals)
     go options positionals ("--prune" : rest) =
@@ -334,6 +351,10 @@ parseFetch arguments = do
         go (options {fetchTags = True, fetchNoTags = False}) positionals rest
     go options positionals ("--no-tags" : rest) =
         go (options {fetchTags = False, fetchNoTags = True}) positionals rest
+    go options positionals ("--progress" : rest) =
+        go (options {fetchProgressMode = Just True}) positionals rest
+    go options positionals ("--no-progress" : rest) =
+        go (options {fetchProgressMode = Just False}) positionals rest
     go _ _ (argument : _)
         | "-" `isPrefixOf` argument =
             Left ("haskell-git: fetch does not understand " ++ argument)
@@ -405,12 +426,32 @@ parseCommit ["-m", message] = Right (CommitCommand message)
 parseCommit _ = Left "haskell-git: usage: commit -m <message>"
 
 parsePull :: [String] -> Either String Command
-parsePull [] = Right (PullCommand "origin" defaultFetchOptions)
-parsePull ["--rebase"] = Right (PullRebaseCommand "origin")
-parsePull ["--ff-only"] = Right (PullFFOnlyCommand "origin")
-parsePull ["--ff-only", remote] = Right (PullFFOnlyCommand remote)
-parsePull [remote] = Right (PullCommand remote defaultFetchOptions)
-parsePull _ = Left "haskell-git: usage: pull [--rebase|--ff-only] [<remote>]"
+parsePull arguments = do
+    (mode, rebase, ffOnly, positionals) <- go Nothing False False [] arguments
+    case positionals of
+        [] -> build mode rebase ffOnly "origin"
+        [remote] -> build mode rebase ffOnly remote
+        _ -> Left "haskell-git: usage: pull [--rebase|--ff-only] [--progress|--no-progress] [<remote>]"
+  where
+    build mode rebase ffOnly remote
+        | rebase && ffOnly =
+            Left "haskell-git: pull does not understand both --rebase and --ff-only"
+        | rebase = Right (PullRebaseCommand remote mode)
+        | ffOnly = Right (PullFFOnlyCommand remote mode)
+        | otherwise = Right (PullCommand remote defaultFetchOptions mode)
+    go mode rebase ffOnly positionals [] =
+        Right (mode, rebase, ffOnly, reverse positionals)
+    go mode _ ffOnly positionals ("--rebase" : rest) =
+        go mode True ffOnly positionals rest
+    go mode rebase _ positionals ("--ff-only" : rest) =
+        go mode rebase True positionals rest
+    go _ rebase ffOnly positionals ("--progress" : rest) =
+        go (Just True) rebase ffOnly positionals rest
+    go _ rebase ffOnly positionals ("--no-progress" : rest) =
+        go (Just False) rebase ffOnly positionals rest
+    go _ _ _ _ (argument : _)
+        | "-" `isPrefixOf` argument =
+            Left ("haskell-git: pull does not understand " ++ argument)
 
 parseRebase :: [String] -> Either String Command
 parseRebase ["--abort"] = Right (RebaseCommand RebaseAbort)
@@ -422,11 +463,28 @@ parseRebase ["--onto", newBase, upstream] =
 parseRebase _ =
     Left "haskell-git: usage: rebase [--abort|--continue|--skip] <upstream> | rebase --onto <newbase> <upstream>"
 
-parseClone :: Bool -> [String] -> Either String Command
-parseClone recursive [remoteUrl] = Right (CloneCommand recursive remoteUrl Nothing)
-parseClone recursive [remoteUrl, destination] =
-    Right (CloneCommand recursive remoteUrl (Just destination))
-parseClone _ _ = Left "haskell-git: usage: clone [--recurse-submodules] <url> [<directory>]"
+parseClone :: [String] -> Either String Command
+parseClone arguments = do
+    (recursive, progressMode, positionals) <- go False Nothing [] arguments
+    case positionals of
+        [remoteUrl] -> Right (CloneCommand recursive remoteUrl Nothing progressMode)
+        [remoteUrl, destination] ->
+            Right (CloneCommand recursive remoteUrl (Just destination) progressMode)
+        _ -> Left "haskell-git: usage: clone [--recurse-submodules] [--progress|--no-progress] <url> [<directory>]"
+  where
+    go recursive progressMode positionals [] =
+        Right (recursive, progressMode, reverse positionals)
+    go _ progressMode positionals ("--recurse-submodules" : rest) =
+        go True progressMode positionals rest
+    go recursive _ positionals ("--progress" : rest) =
+        go recursive (Just True) positionals rest
+    go recursive _ positionals ("--no-progress" : rest) =
+        go recursive (Just False) positionals rest
+    go _ _ _ (argument : _)
+        | "-" `isPrefixOf` argument =
+            Left ("haskell-git: clone does not understand " ++ argument)
+    go recursive progressMode positionals (argument : rest) =
+        go recursive progressMode (argument : positionals) rest
 
 parseSubmodule :: [String] -> Either String Command
 parseSubmodule ["status"] = Right (SubmoduleCommand SubmoduleStatus)
@@ -587,9 +645,10 @@ usageText =
         , "  commit-tree tree [-p parent]... -m message"
         , "                                   write a commit object"
         , "  update-ref ref rev               point a reference at an object"
-        , "  clone [--recurse-submodules] url [dir]"
+        , "  clone [--recurse-submodules] [--progress|--no-progress] url [dir]"
         , "                                   clone over HTTP, SSH, or git://"
-        , "  fetch [remote] [refspec...]      fetch branches and tags"
+        , "  fetch [--progress|--no-progress] [remote] [refspec...]"
+        , "                                   fetch branches and tags"
         , "  push [--force] [--delete] remote [refspec...]"
         , "                                   update remote branches"
         , "  checkout [-b branch [start]] rev switch branches or commits"
@@ -599,7 +658,7 @@ usageText =
         , "  reset --hard rev                 move HEAD and reset the worktree"
         , "  merge [--abort|--continue] rev   merge a commit or branch"
         , "  commit -m message                commit the index"
-        , "  pull [remote]                    fetch and merge"
+        , "  pull [--rebase|--ff-only] [--progress|--no-progress] [remote]"
         , "  rebase [--abort|--continue|--skip] upstream"
         , "  rebase --onto <newbase> <upstream>"
         , "                                   replay the current branch"
@@ -624,8 +683,8 @@ commandUsage name =
         , ("write-tree", "usage: haskell-git write-tree\n")
         , ("commit-tree", "usage: haskell-git commit-tree <tree> [-p <parent>]... -m <message>\n")
         , ("update-ref", "usage: haskell-git update-ref <ref> <revision>\n")
-        , ("clone", "usage: haskell-git clone [--recurse-submodules] <url> [<directory>]\n")
-        , ("fetch", "usage: haskell-git fetch [<remote>] [<refspec>...]\n")
+        , ("clone", "usage: haskell-git clone [--recurse-submodules] [--progress|--no-progress] <url> [<directory>]\n")
+        , ("fetch", "usage: haskell-git fetch [--progress|--no-progress] [<remote>] [<refspec>...]\n")
         , ("push", "usage: haskell-git push [--force] [--delete] <remote> [<refspec>...]\n")
         , ("checkout", "usage: haskell-git checkout [-b <branch> [<start>]] <revision>\n")
         , ("switch", "usage: haskell-git switch <branch>\n")
@@ -634,7 +693,7 @@ commandUsage name =
         , ("reset", "usage: haskell-git reset --hard <revision>\n")
         , ("merge", "usage: haskell-git merge [--abort|--continue] <revision>\n")
         , ("commit", "usage: haskell-git commit -m <message>\n")
-        , ("pull", "usage: haskell-git pull [<remote>]\n")
+        , ("pull", "usage: haskell-git pull [--rebase|--ff-only] [--progress|--no-progress] [<remote>]\n")
         , ("rebase", "usage: haskell-git rebase [--abort|--continue|--skip] <upstream>\n")
         , ("submodule", "usage: haskell-git submodule status | submodule update --init [--recursive]\n")
         , ("remote", "usage: haskell-git remote add|set-url|get-url <name> [<url>]\n")
@@ -791,10 +850,10 @@ runCommand (UpdateRefCommand refPath objectText) = do
     objectId <- resolveObjectId repository store objectText
     writeRefValue repository refPath objectId
 
-runCommand (CloneCommand recursive remoteUrl maybeDestination) = do
+runCommand (CloneCommand recursive remoteUrl maybeDestination progressMode) = do
     let destination = fromMaybe (defaultCloneDestination remoteUrl) maybeDestination
     putStrLn ("Cloning into '" ++ destination ++ "'...")
-    result <- cloneRepository remoteUrl destination
+    result <- withProgress progressMode $ \progress -> cloneRepositoryWithProgress progress remoteUrl destination
     when recursive $ do
         found <- findRepository destination
         case found of
@@ -812,19 +871,21 @@ runCommand (CloneCommand recursive remoteUrl maybeDestination) = do
                     ++ shortBranchName (cloneLocalBranch result)
                 )
 
-runCommand (FetchCommand remote refspecs options) = do
+runCommand (FetchCommand remote refspecs options progressMode) = do
     repository <- requireRepository "."
-    result <- fetchRepository repository remote refspecs options
+    result <- withProgress progressMode $ \progress ->
+        fetchRepositoryWithProgress progress repository remote refspecs options
     forM_ (fetchUpdatedRefs result) $ \(refPath, objectId) ->
         putStrLn (" * " ++ refPath ++ " -> " ++ objectIdToHex objectId)
     case fetchHeadObject result of
         Nothing -> putStrLn "Already up to date."
         Just _ -> pure ()
 
-runCommand (PullFFOnlyCommand remote) = do
+runCommand (PullFFOnlyCommand remote progressMode) = do
     repository <- requireRepository "."
-    result <-
-        pullRepositoryWith
+    result <- withProgress progressMode $ \progress ->
+        pullRepositoryWithProgress
+            progress
             defaultMergeOptions {mergeFFOnly = True}
             repository
             remote
@@ -930,9 +991,10 @@ runCommand (CommitCommand message) = do
     commitId <- commitCurrentIndex repository store message
     putStrLn (objectIdToHex commitId)
 
-runCommand (PullCommand remote options) = do
+runCommand (PullCommand remote options progressMode) = do
     repository <- requireRepository "."
-    result <- pullRepository repository remote options
+    result <- withProgress progressMode $ \progress ->
+        pullRepositoryWithProgress progress defaultMergeOptions repository remote options
     case result of
         MergeUpToDate -> putStrLn "Already up to date."
         MergeFastForward objectId -> putStrLn ("Fast-forward to " ++ objectIdToHex objectId)
@@ -941,9 +1003,10 @@ runCommand (PullCommand remote options) = do
             mapM_ (putStrLn . ("CONFLICT " ++)) paths
             exitWith (ExitFailure 1)
 
-runCommand (PullRebaseCommand remote) = do
+runCommand (PullRebaseCommand remote progressMode) = do
     repository <- requireRepository "."
-    result <- pullRepositoryRebase repository remote defaultFetchOptions
+    result <- withProgress progressMode $ \progress ->
+        pullRepositoryRebaseWithProgress progress repository remote defaultFetchOptions
     reportRebaseResult result
 
 runCommand (RebaseCommand action) = do

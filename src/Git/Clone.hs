@@ -1,10 +1,12 @@
 module Git.Clone
     ( CloneResult (..)
     , cloneRepository
+    , cloneRepositoryWithProgress
     ) where
 
 import Control.Exception (onException)
 import Control.Monad (forM, forM_, when)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.ByteString as BS
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS8
@@ -40,6 +42,18 @@ import Git.Object.Tree
     )
 import Git.Pack.Import (importPackFile)
 import Git.Pack.Retain (retainPackDirectly, retainPackFile)
+import Git.Progress
+    ( Phase (..)
+    , Progress
+    , noProgress
+    , progressAbort
+    , progressBegin
+    , progressEnd
+    , progressFinish
+    , progressNetwork
+    , progressObjects
+    , progressRemote
+    )
 import Git.Protocol.SmartHTTP
     ( DiscoveryAdvertisement
     , DiscoveryRef
@@ -65,7 +79,8 @@ import Git.Repo
     )
 import Git.Store (Store, flattenTree, loadStore, readObjectOrFail, storeRepository)
 import Git.Transport
-    ( Service (..)
+    ( FetchProgress (..)
+    , Service (..)
     , Transport (..)
     , transportUploadPackToFileFor
     , parseRemoteUrl
@@ -80,13 +95,22 @@ data CloneResult = CloneResult
     deriving (Eq, Show)
 
 cloneRepository :: String -> FilePath -> IO CloneResult
-cloneRepository remoteUrl destination = do
+cloneRepository = cloneRepositoryWithProgress noProgress
+
+-- | Clone and report progress to the given renderer. 'cloneRepository' is the
+-- no-progress variant used by the tests and by callers that manage their own
+-- output.
+cloneRepositoryWithProgress :: Progress -> String -> FilePath -> IO CloneResult
+cloneRepositoryWithProgress progress remoteUrl destination = do
     validateRemoteUrl remoteUrl
     prepareDestination destination
-    cloneInto remoteUrl destination `onException` removePathForcibly destination
+    cloneInto progress remoteUrl destination
+        `onException` do
+            progressAbort progress
+            removePathForcibly destination
 
-cloneInto :: String -> FilePath -> IO CloneResult
-cloneInto remoteUrl destination = do
+cloneInto :: Progress -> String -> FilePath -> IO CloneResult
+cloneInto progress remoteUrl destination = do
     config <- loadGlobalConfig
     withTransport config remoteUrl $ \transport -> do
         advertisement <- transportDiscovery transport UploadPackService
@@ -96,7 +120,10 @@ cloneInto remoteUrl destination = do
             branchRefs = filter (isBranchRef . discoveryRefName) advertisedRefs
             tagRefs = filter (isTagRef . discoveryRefName) advertisedRefs
         if null branchRefs
-            then cloneEmptyRepository objectFormat remoteUrl destination advertisement
+            then do
+                result <- cloneEmptyRepository objectFormat remoteUrl destination advertisement
+                progressFinish progress
+                pure result
             else do
                 defaultBranchPath <- chooseDefaultBranch advertisement branchRefs
                 let branchName = branchShortName defaultBranchPath
@@ -105,22 +132,44 @@ cloneInto remoteUrl destination = do
                 repository <- initRepositoryWithFormat objectFormat branchName destination
                 headObjectId <- requireDefaultHead defaultBranchPath branchRefs
                 let wantedIds = nub (map discoveryRefObjectId (branchRefs ++ tagRefs))
-                withTemporaryPack $ \packPath -> do
+                    fetchProgress =
+                        FetchProgress (progressNetwork progress) (progressRemote progress)
+                progressBegin progress PhaseReceiving
+                deltaRef <- newIORef (0 :: Int)
+                ( withTemporaryPack $ \packPath -> do
                     transportUploadPackToFileFor
                         transport
                         advertisement
                         (discoveryCapabilities advertisement)
                         wantedIds
                         []
+                        fetchProgress
                         packPath
-                    retainedDirectly <- retainPackDirectly objectFormat repository packPath
+                    retainedDirectly <-
+                        retainPackDirectly
+                            objectFormat
+                            repository
+                            packPath
+                            (progressObjects progress)
+                            (\_ total -> writeIORef deltaRef total)
                     when (not retainedDirectly) $ do
-                        importPackFile objectFormat repository packPath
+                        importPackFile objectFormat repository packPath (progressObjects progress)
                         retainPackFile objectFormat repository packPath
+                    )
+                    `onException` progressAbort progress
+                progressEnd progress PhaseReceiving
+                deltaTotal <- readIORef deltaRef
+                when (deltaTotal > 0) $ do
+                    progressBegin progress PhaseResolvingDeltas
+                    progressObjects progress deltaTotal deltaTotal
+                    progressEnd progress PhaseResolvingDeltas
                 store <- loadStore repository
-                checkoutTreeAndIndex store repository headObjectId
+                progressBegin progress PhaseUpdatingFiles
+                checkoutTreeAndIndex store repository headObjectId (progressObjects progress)
+                progressEnd progress PhaseUpdatingFiles
                 writeCloneRefs repository defaultBranchPath headObjectId branchRefs tagRefs
                 writeRemoteConfig repository remoteUrl defaultBranchPath
+                progressFinish progress
                 pure (CloneResult (Just headObjectId) defaultBranchPath)
 
 cloneEmptyRepository
@@ -185,11 +234,19 @@ symrefTarget advertisement = do
 -- | Materialise the tree and write the version 2 index from the same payload
 -- reads. A clone needs both, and reading every blob twice for the size fields
 -- in the index is avoidable.
-checkoutTreeAndIndex :: Store -> Repository -> ObjectId -> IO ()
-checkoutTreeAndIndex store repository headObjectId = do
+checkoutTreeAndIndex
+    :: Store
+    -> Repository
+    -> ObjectId
+    -> (Int -> Int -> IO ())
+    -> IO ()
+checkoutTreeAndIndex store repository headObjectId reportProgress = do
     flattened <- flattenHeadTree store headObjectId
-    entries <- forM flattened $ \(relativePath, entry) -> do
+    let total = length flattened
+    reportProgress 0 total
+    entries <- forM (zip [1 ..] flattened) $ \(index, (relativePath, entry)) -> do
         size <- materializeEntry store repository relativePath entry
+        when (index == total || index `mod` 32 == 0) (reportProgress index total)
         pure (indexEntryFromTree relativePath entry (fromIntegral size))
     writeIndexFile
         (repositoryObjectFormat repository)

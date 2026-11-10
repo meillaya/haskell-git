@@ -1,11 +1,14 @@
 module Git.Pull
     ( pullRepository
     , pullRepositoryRebase
+    , pullRepositoryRebaseWithProgress
     , pullRepositoryWith
+    , pullRepositoryWithProgress
     ) where
 
 import Data.Char (isHexDigit)
-import Git.Fetch (FetchOptions, fetchRepository)
+import Git.Fetch (FetchOptions, fetchRepository, fetchRepositoryWithProgress)
+import Git.Progress (Progress, noProgress)
 import Git.Hash (ObjectId, objectIdFromHexFor)
 import Git.Merge (MergeOptions, MergeResult, defaultMergeOptions, mergeRepository, mergeRepositoryWith)
 import Git.Rebase (RebaseResult, rebaseRepository)
@@ -24,18 +27,35 @@ pullRepository :: Repository -> String -> FetchOptions -> IO MergeResult
 pullRepository = pullRepositoryWith defaultMergeOptions
 
 pullRepositoryWith :: MergeOptions -> Repository -> String -> FetchOptions -> IO MergeResult
-pullRepositoryWith mergeOptions repository remote options = do
-    (store, targetId) <- fetchTarget repository remote options
+pullRepositoryWith = pullRepositoryWithProgress noProgress
+
+pullRepositoryWithProgress
+    :: Progress
+    -> MergeOptions
+    -> Repository
+    -> String
+    -> FetchOptions
+    -> IO MergeResult
+pullRepositoryWithProgress progress mergeOptions repository remote options = do
+    (store, targetId) <- fetchTarget progress repository remote options
     mergeRepositoryWith mergeOptions repository store targetId
 
 pullRepositoryRebase :: Repository -> String -> FetchOptions -> IO RebaseResult
-pullRepositoryRebase repository remote options = do
-    (store, targetId) <- fetchTarget repository remote options
+pullRepositoryRebase = pullRepositoryRebaseWithProgress noProgress
+
+pullRepositoryRebaseWithProgress
+    :: Progress
+    -> Repository
+    -> String
+    -> FetchOptions
+    -> IO RebaseResult
+pullRepositoryRebaseWithProgress progress repository remote options = do
+    (store, targetId) <- fetchTarget progress repository remote options
     rebaseRepository repository store targetId
 
-fetchTarget :: Repository -> String -> FetchOptions -> IO (Store, ObjectId)
-fetchTarget repository remote options = do
-    _ <- fetchRepository repository remote [] options
+fetchTarget :: Progress -> Repository -> String -> FetchOptions -> IO (Store, ObjectId)
+fetchTarget progress repository remote options = do
+    _ <- fetchRepositoryWithProgress progress repository remote [] options
     fetchedId <- firstFetchHead repository
     store <- loadStore repository
     targetId <- peelToCommit repository store fetchedId
