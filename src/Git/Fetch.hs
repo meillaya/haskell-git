@@ -9,6 +9,7 @@ import Control.Monad (forM, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS8
 import Data.List (find, isPrefixOf, isSuffixOf, nub)
+import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Git.Config (Config, configGet, configGetAll, loadRepositoryConfig)
 import Git.Hash (ObjectId, objectIdToHex)
@@ -27,12 +28,14 @@ import Git.RefSpec
     , applyRefSpec
     , parseRefSpec
     )
+import Git.Object (GitObjectType (..), gitObjectType)
 import Git.Refs (deleteRef, listRefs, writeRefValue)
 import Git.Repo
     ( Repository
     , repositoryFetchHeadPath
     , repositoryObjectFormat
     )
+import Git.Store (Store, loadStore, readObjectOrFail, walkCommits)
 import Git.Transport
     ( Service (..)
     , Transport (..)
@@ -43,12 +46,13 @@ import Git.Transport
 
 data FetchOptions = FetchOptions
     { fetchTags :: Bool
+    , fetchNoTags :: Bool
     , fetchPrune :: Bool
     }
     deriving (Eq, Show)
 
 defaultFetchOptions :: FetchOptions
-defaultFetchOptions = FetchOptions True False
+defaultFetchOptions = FetchOptions False False False
 
 data FetchResult = FetchResult
     { fetchUpdatedRefs :: [(FilePath, ObjectId)]
@@ -82,19 +86,34 @@ fetchRepository repository remoteArgument explicitRefSpecs options = do
                 ( userError
                     "remote object format does not match the local repository"
                 )
-        let matched =
+        localRefs <- listRefs repository
+        let haves =
+                nub
+                    [ objectId
+                    | (refName, objectId) <- localRefs
+                    , "refs/heads/" `isPrefixOf` refName
+                        || "refs/remotes/" `isPrefixOf` refName
+                    ]
+            matched =
                 [ (remoteRef, spec, destination)
                 | remoteRef <- advertised
                 , spec <- requestedSpecs
                 , Just destination <- [applyRefSpec spec (bsToText (discoveryRefName remoteRef))]
                 , shouldUpdate spec (bsToText (discoveryRefName remoteRef))
                 ]
-            tagRefs =
-                if fetchTags options
-                    then filter isTagRef advertised
-                    else []
+            peeledMap =
+                Map.fromList
+                    [ (bsToText (discoveryRefName ref), discoveryRefObjectId ref)
+                    | ref <- discoveryRefs advertisement
+                    , isPeeledRef (discoveryRefName ref)
+                    ]
+            allTagRefs = filter isTagRef advertised
+            tagRefs
+                | fetchNoTags options = []
+                | fetchTags options = allTagRefs
+                | otherwise = allTagRefs
             fetchedRefs = map discoveryRefObjectId (map (\(ref, _, _) -> ref) matched)
-            tagIds = map discoveryRefObjectId tagRefs
+            tagIds = map discoveryRefObjectId allTagRefs
             wantedIds = nub (fetchedRefs ++ tagIds)
         when (not (null wantedIds)) $
             withTemporaryPack $ \packPath -> do
@@ -102,10 +121,18 @@ fetchRepository repository remoteArgument explicitRefSpecs options = do
                     transport
                     (discoveryCapabilities advertisement)
                     wantedIds
+                    haves
                     packPath
                 importPackFile objectFormat repository packPath
         updated <- updateRefs repository matched
-        updatedTags <- writeTags repository tagRefs
+        autoTags <-
+            if fetchNoTags options || fetchTags options
+                then pure tagRefs
+                else do
+                    store <- loadStore repository
+                    reachable <- reachableCommits store fetchedRefs
+                    pure (filter (tagTargetReachable peeledMap reachable) allTagRefs)
+        updatedTags <- writeTags repository autoTags
         when (fetchPrune options) (pruneRemoteRefs repository remote matched)
         writeFetchHead repository remote matched
         let headObject =
@@ -117,6 +144,23 @@ fetchRepository repository remoteArgument explicitRefSpecs options = do
                 { fetchUpdatedRefs = updated ++ updatedTags
                 , fetchHeadObject = headObject
                 }
+
+reachableCommits :: Store -> [ObjectId] -> IO (Set.Set ObjectId)
+reachableCommits store tips = do
+    commits <- fmap concat $
+        forM tips $ \objectId -> do
+            objectValue <- readObjectOrFail store objectId
+            case gitObjectType objectValue of
+                CommitObject -> map fst <$> walkCommits store objectId
+                _ -> pure []
+    pure (Set.fromList commits)
+
+tagTargetReachable :: Map.Map String ObjectId -> Set.Set ObjectId -> DiscoveryRef -> Bool
+tagTargetReachable peeled reachable tagRef =
+    Set.member target reachable
+  where
+    name = bsToText (discoveryRefName tagRef)
+    target = Map.findWithDefault (discoveryRefObjectId tagRef) (name ++ "^{}") peeled
 
 shouldUpdate :: RefSpec -> String -> Bool
 shouldUpdate _ remoteRef = not ("refs/pull/" `isPrefixOf` remoteRef)

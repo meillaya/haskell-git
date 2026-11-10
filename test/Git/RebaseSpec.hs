@@ -8,6 +8,7 @@ import Git.Rebase
     ( RebaseResult (..)
     , rebaseAbort
     , rebaseRepository
+    , rebaseRepositoryOnto
     )
 import Git.Refs (resolveRevision)
 import Git.Repo (Repository, findRepository)
@@ -25,6 +26,7 @@ import TestSupport
 run :: IO ()
 run = do
     rebasesOntoMain
+    rebasesOntoNewBase
     detectsRebaseConflict
 
 rebasesOntoMain :: IO ()
@@ -61,6 +63,37 @@ rebasesOntoMain =
         assert featureExists "rebase should keep the replayed file"
         _ <- runGit ["-C", temporaryDir, "fsck", "--strict"]
         pure ()
+
+rebasesOntoNewBase :: IO ()
+rebasesOntoNewBase =
+    withTempDirectory "haskell-git-rebase-onto" $ \temporaryDir -> do
+        _ <- createRepository temporaryDir
+        baseHead <- trim <$> runGit ["-C", temporaryDir, "rev-parse", "HEAD"]
+        _ <- runGit ["-C", temporaryDir, "checkout", "-q", "-b", "feature"]
+        writeFile (temporaryDir </> "one.txt") "one\n"
+        _ <- runGit ["-C", temporaryDir, "add", "-A"]
+        _ <- runGit ["-C", temporaryDir, "commit", "-qm", "one"]
+        writeFile (temporaryDir </> "two.txt") "two\n"
+        _ <- runGit ["-C", temporaryDir, "add", "-A"]
+        _ <- runGit ["-C", temporaryDir, "commit", "-qm", "two"]
+        _ <- runGit ["-C", temporaryDir, "checkout", "-q", "main"]
+        writeFile (temporaryDir </> "main.txt") "main\n"
+        _ <- runGit ["-C", temporaryDir, "add", "-A"]
+        _ <- runGit ["-C", temporaryDir, "commit", "-qm", "main advance"]
+        mainHead <- trim <$> runGit ["-C", temporaryDir, "rev-parse", "HEAD"]
+        _ <- runGit ["-C", temporaryDir, "checkout", "-q", "feature"]
+        repository <- requireRepository temporaryDir
+        store <- loadStore repository
+        newBase <- resolveCommit repository "main"
+        upstream <- resolveCommit repository baseHead
+        result <- rebaseRepositoryOnto repository store newBase upstream
+        case result of
+            RebaseComplete _ -> pure ()
+            _ -> fail ("expected --onto rebase to complete, got " ++ show result)
+        subjects <- lines <$> runGit ["-C", temporaryDir, "log", "--format=%s", "-n", "3"]
+        assertEqual ["two", "one", "main advance"] subjects "The feature commits should be replayed onto the new base"
+        parentText <- runGit ["-C", temporaryDir, "log", "--format=%P", "-n", "1", "refs/heads/feature~1"]
+        assertContains mainHead parentText "The first replayed commit should sit on the new base"
 
 detectsRebaseConflict :: IO ()
 detectsRebaseConflict =

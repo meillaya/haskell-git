@@ -1,12 +1,13 @@
 module Git.Pull
     ( pullRepository
     , pullRepositoryRebase
+    , pullRepositoryWith
     ) where
 
 import Data.Char (isHexDigit)
 import Git.Fetch (FetchOptions, fetchRepository)
 import Git.Hash (ObjectId, objectIdFromHexFor)
-import Git.Merge (MergeResult, mergeRepository)
+import Git.Merge (MergeOptions, MergeResult, defaultMergeOptions, mergeRepository, mergeRepositoryWith)
 import Git.Rebase (RebaseResult, rebaseRepository)
 import Git.Object (GitObjectType (..), gitObjectType)
 import Git.Object.Tag (tagFromObjectFor, tagObject)
@@ -20,9 +21,12 @@ import Git.Store (Store, loadStore, readObjectOrFail)
 -- | Fetch then merge the fetched head. Fast-forwarding and clean merges are
 -- handled by 'mergeRepository'; conflicts are returned to the caller.
 pullRepository :: Repository -> String -> FetchOptions -> IO MergeResult
-pullRepository repository remote options = do
+pullRepository = pullRepositoryWith defaultMergeOptions
+
+pullRepositoryWith :: MergeOptions -> Repository -> String -> FetchOptions -> IO MergeResult
+pullRepositoryWith mergeOptions repository remote options = do
     (store, targetId) <- fetchTarget repository remote options
-    mergeRepository repository store targetId
+    mergeRepositoryWith mergeOptions repository store targetId
 
 pullRepositoryRebase :: Repository -> String -> FetchOptions -> IO RebaseResult
 pullRepositoryRebase repository remote options = do

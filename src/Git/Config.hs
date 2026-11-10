@@ -1,5 +1,6 @@
 module Git.Config
     ( Config
+    , appendConfigValue
     , ConfigEntry (..)
     , configEntries
     , configGet
@@ -33,6 +34,16 @@ configEntries :: Config -> [ConfigEntry]
 configEntries (Config entries) = entries
 
 -- | Read a config file. A missing file is an empty config.
+-- | Append a value to a repository config file. Existing sections are left
+-- alone; the last value wins when the config is read back.
+appendConfigValue :: Repository -> String -> Maybe String -> String -> String -> IO ()
+appendConfigValue repository section subsection key value = do
+    let header = "[" ++ section ++ maybe "" (\name -> " \"" ++ escape name ++ "\"") subsection ++ "]\n"
+        body = "\t" ++ key ++ " = " ++ value ++ "\n"
+    appendFile (repositoryConfigPath repository) (header ++ body)
+  where
+    escape = concatMap (\character -> if character == '"' || character == '\\' then ['\\', character] else [character])
+
 readConfigFile :: FilePath -> IO Config
 readConfigFile path = do
     exists <- doesFileExist path

@@ -6,7 +6,7 @@ import Control.Exception (IOException, try)
 import Git.Clone (cloneRepository)
 import Git.Push (PushOptions (..), PushResult (..), defaultPushOptions, pushRepository)
 import Git.Repo (Repository, findRepository)
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 import TestSupport
     ( assertEqual
@@ -18,6 +18,8 @@ import TestSupport
 run :: IO ()
 run = do
     pushesNewCommit
+    setsUpstream
+    rejectsStaleLease
     rejectsNonFastForward
 
 pushesNewCommit :: IO ()
@@ -43,6 +45,76 @@ pushesNewCommit =
             _ <- pushRepository repository "origin" ["refs/heads/main:refs/heads/main"] defaultPushOptions
             remoteHead <- trim <$> runGit ["-C", bareRepository, "rev-parse", "refs/heads/main"]
             assertEqual pushedHead remoteHead "Push should update the remote branch"
+
+setsUpstream :: IO ()
+setsUpstream =
+    withTempDirectory "haskell-git-push-upstream" $ \temporaryDir -> do
+        let sourceDirectory = temporaryDir </> "source"
+            serveDirectory = temporaryDir </> "serve"
+            bareRepository = serveDirectory </> "repo.git"
+            destination = temporaryDir </> "clone"
+        _ <- createSource sourceDirectory
+        createDirectoryIfMissing True serveDirectory
+        _ <- runGit ["clone", "-q", "--bare", sourceDirectory, bareRepository]
+        _ <- runGit ["-C", bareRepository, "config", "http.receivepack", "true"]
+        withHttpBackendServer serveDirectory "repo.git" $ \remoteUrl -> do
+            _ <- cloneRepository remoteUrl destination
+            _ <- runGit ["-C", destination, "config", "user.email", "ada@example.com"]
+            _ <- runGit ["-C", destination, "config", "user.name", "Ada"]
+            writeFile (destination </> "upstream.txt") "upstream\n"
+            _ <- runGit ["-C", destination, "add", "-A"]
+            _ <- runGit ["-C", destination, "commit", "-qm", "upstream"]
+            repository <- requireRepository destination
+            _ <- pushRepository repository "origin" ["refs/heads/main:refs/heads/main"] defaultPushOptions {pushSetUpstream = True}
+            remoteSetting <- trim <$> runGit ["-C", destination, "config", "branch.main.remote"]
+            mergeSetting <- trim <$> runGit ["-C", destination, "config", "branch.main.merge"]
+            assertEqual "origin" remoteSetting "push -u should record the remote"
+            assertEqual "refs/heads/main" mergeSetting "push -u should record the merge ref"
+            trackingExists <-
+                doesFileExist (destination </> ".git" </> "refs" </> "remotes" </> "origin" </> "main")
+            assertEqual True trackingExists "push -u should create the remote-tracking ref"
+
+rejectsStaleLease :: IO ()
+rejectsStaleLease =
+    withTempDirectory "haskell-git-push-lease" $ \temporaryDir -> do
+        let sourceDirectory = temporaryDir </> "source"
+            serveDirectory = temporaryDir </> "serve"
+            bareRepository = serveDirectory </> "repo.git"
+            destination = temporaryDir </> "clone"
+        _ <- createSource sourceDirectory
+        createDirectoryIfMissing True serveDirectory
+        _ <- runGit ["clone", "-q", "--bare", sourceDirectory, bareRepository]
+        _ <- runGit ["-C", bareRepository, "config", "http.receivepack", "true"]
+        withHttpBackendServer serveDirectory "repo.git" $ \remoteUrl -> do
+            _ <- cloneRepository remoteUrl destination
+            _ <- runGit ["-C", destination, "config", "user.email", "ada@example.com"]
+            _ <- runGit ["-C", destination, "config", "user.name", "Ada"]
+            writeFile (destination </> "local.txt") "local\n"
+            _ <- runGit ["-C", destination, "add", "-A"]
+            _ <- runGit ["-C", destination, "commit", "-qm", "local"]
+            repository <- requireRepository destination
+            _ <- pushRepository repository "origin" ["refs/heads/main:refs/heads/main"] defaultPushOptions
+            _ <- runGit ["-C", sourceDirectory, "config", "user.email", "ada@example.com"]
+            _ <- runGit ["-C", sourceDirectory, "config", "user.name", "Ada"]
+            writeFile (sourceDirectory </> "remote.txt") "remote\n"
+            _ <- runGit ["-C", sourceDirectory, "add", "-A"]
+            _ <- runGit ["-C", sourceDirectory, "commit", "-qm", "remote"]
+            _ <- runGit ["-C", sourceDirectory, "push", "-q", "-f", bareRepository, "main"]
+            writeFile (destination </> "local2.txt") "local2\n"
+            _ <- runGit ["-C", destination, "add", "-A"]
+            _ <- runGit ["-C", destination, "commit", "-qm", "local2"]
+            repositoryAfter <- requireRepository destination
+            result <-
+                try
+                    ( pushRepository
+                        repositoryAfter
+                        "origin"
+                        ["refs/heads/main:refs/heads/main"]
+                        defaultPushOptions {pushForceWithLease = True}
+                    ) :: IO (Either IOException PushResult)
+            case result of
+                Left _ -> pure ()
+                Right _ -> fail "A stale --force-with-lease push should fail"
 
 rejectsNonFastForward :: IO ()
 rejectsNonFastForward =

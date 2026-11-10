@@ -2,6 +2,7 @@ module Main where
 
 import qualified Git.AuthSpec as AuthSpec
 import qualified Git.CloneSpec as CloneSpec
+import qualified Git.DiffSpec as DiffSpec
 import qualified Git.FetchSpec as FetchSpec
 import qualified Git.IndexSpec as IndexSpec
 import qualified Git.InteropSpec as InteropSpec
@@ -15,6 +16,7 @@ import qualified Git.Pack.IndexSpec as PackIndexSpec
 import qualified Git.Pack.ReadSpec as PackReadSpec
 import qualified Git.Pack.StreamingSpec as PackStreamingSpec
 import qualified Git.PackSpec as PackSpec
+import qualified Git.PropertySpec as PropertySpec
 import qualified Git.Protocol.PacketLineSpec as PacketLineSpec
 import qualified Git.Protocol.SmartHTTPSpec as SmartHTTPSpec
 import qualified Git.PushSpec as PushSpec
@@ -42,6 +44,7 @@ main = do
     PackIndexSpec.run
     PackReadSpec.run
     PackStreamingSpec.run
+    PropertySpec.run
     IndexSpec.run
     StoreSpec.run
     SmartHTTPSpec.run
@@ -56,5 +59,6 @@ main = do
     WorktreeSpec.run
     MergeSpec.run
     RebaseSpec.run
+    DiffSpec.run
     SubmoduleSpec.run
     putStrLn "All tests passed."

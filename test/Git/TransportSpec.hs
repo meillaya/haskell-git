@@ -6,6 +6,7 @@ import Control.Exception (bracket)
 import Control.Concurrent (threadDelay)
 import Git.Clone (CloneResult (..), cloneRepository)
 import Git.Fetch (defaultFetchOptions, fetchRepository)
+import Git.Push (defaultPushOptions, pushRepository)
 import Git.Repo (Repository, findRepository)
 import System.Directory (createDirectoryIfMissing)
 import System.Environment (lookupEnv, setEnv, unsetEnv)
@@ -30,7 +31,9 @@ import TestSupport
 run :: IO ()
 run = do
     sshCloneAndFetch
+    sshPush
     gitDaemonCloneAndFetch
+    gitDaemonPush
 
 sshCloneAndFetch :: IO ()
 sshCloneAndFetch =
@@ -65,6 +68,39 @@ sshCloneAndFetch =
             _ <- runGit ["-C", destination, "fsck", "--strict"]
             pure ()
 
+sshPush :: IO ()
+sshPush =
+    withTempDirectory "haskell-git-ssh-push" $ \temporaryDir -> do
+        let sourceDirectory = temporaryDir </> "source"
+            bareRepository = temporaryDir </> "repo.git"
+            destination = temporaryDir </> "clone"
+            sshScript = temporaryDir </> "fake-ssh.sh"
+        _ <- createSource sourceDirectory
+        _ <- runGit ["clone", "-q", "--bare", sourceDirectory, bareRepository]
+        writeFile
+            sshScript
+            ( unlines
+                [ "#!/bin/sh"
+                , "case \"$*\" in"
+                , "  *git-receive-pack*) exec git-receive-pack " ++ show bareRepository ++ " 2>/dev/null ;;"
+                , "  *) exec git-upload-pack " ++ show bareRepository ++ " 2>/dev/null ;;"
+                , "esac"
+                ]
+            )
+        _ <- runBash ("chmod +x " ++ sshScript)
+        withEnvironment "GIT_SSH_COMMAND" sshScript $ do
+            _ <- cloneRepository "ssh://example/repo.git" destination
+            _ <- runGit ["-C", destination, "config", "user.email", "ada@example.com"]
+            _ <- runGit ["-C", destination, "config", "user.name", "Ada"]
+            writeFile (destination </> "pushed.txt") "pushed\n"
+            _ <- runGit ["-C", destination, "add", "-A"]
+            _ <- runGit ["-C", destination, "commit", "-qm", "ssh push"]
+            repository <- requireRepository destination
+            _ <- pushRepository repository "origin" ["refs/heads/main:refs/heads/main"] defaultPushOptions
+            remoteText <- runGit ["-C", bareRepository, "rev-parse", "refs/heads/main"]
+            localText <- runGit ["-C", destination, "rev-parse", "HEAD"]
+            assertEqual localText remoteText "SSH push should update the remote branch"
+
 gitDaemonCloneAndFetch :: IO ()
 gitDaemonCloneAndFetch =
     withTempDirectory "haskell-git-gitdaemon" $ \temporaryDir -> do
@@ -88,6 +124,34 @@ gitDaemonCloneAndFetch =
                 pure ()
             )
 
+gitDaemonPush :: IO ()
+gitDaemonPush =
+    withTempDirectory "haskell-git-gitdaemon-push" $ \temporaryDir -> do
+        let sourceDirectory = temporaryDir </> "source"
+            serveDirectory = temporaryDir </> "serve"
+            bareRepository = serveDirectory </> "repo.git"
+            destination = temporaryDir </> "clone"
+        _ <- createSource sourceDirectory
+        createDirectoryIfMissing True serveDirectory
+        _ <- runGit ["clone", "-q", "--bare", sourceDirectory, bareRepository]
+        port <- trim <$> runBash "python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); print(s.getsockname()[1]); s.close()'"
+        bracket
+            (startDaemon serveDirectory port)
+            stopDaemon
+            (\_ -> do
+                _ <- cloneRepository ("git://127.0.0.1:" ++ port ++ "/repo.git") destination
+                _ <- runGit ["-C", destination, "config", "user.email", "ada@example.com"]
+                _ <- runGit ["-C", destination, "config", "user.name", "Ada"]
+                writeFile (destination </> "pushed.txt") "pushed\n"
+                _ <- runGit ["-C", destination, "add", "-A"]
+                _ <- runGit ["-C", destination, "commit", "-qm", "git push"]
+                repository <- requireRepository destination
+                _ <- pushRepository repository "origin" ["refs/heads/main:refs/heads/main"] defaultPushOptions
+                remoteText <- runGit ["-C", bareRepository, "rev-parse", "refs/heads/main"]
+                localText <- runGit ["-C", destination, "rev-parse", "HEAD"]
+                assertEqual localText remoteText "git:// push should update the remote branch"
+            )
+
 startDaemon :: FilePath -> String -> IO ProcessHandle
 startDaemon serveDirectory port = do
     (_, _, _, processHandle) <-
@@ -97,6 +161,7 @@ startDaemon serveDirectory port = do
                 [ "daemon"
                 , "--reuseaddr"
                 , "--export-all"
+                , "--enable=receive-pack"
                 , "--base-path=" ++ serveDirectory
                 , "--port=" ++ port
                 , "--listen=127.0.0.1"

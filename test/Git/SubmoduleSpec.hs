@@ -2,7 +2,7 @@ module Git.SubmoduleSpec
     ( run
     ) where
 
-import Data.List (isPrefixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import Git.Clone (cloneRepository)
 import Git.Repo (Repository, findRepository)
 import Git.Store (loadStore)
@@ -12,6 +12,7 @@ import Git.Submodule
     , readSubmodules
     , resolveSubmoduleUrl
     , submoduleStatus
+    , submoduleSync
     , updateSubmodules
     )
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist)
@@ -100,6 +101,10 @@ clonesRecursively =
                 _ <- runGit ["-C", destination, "fsck", "--strict"]
                 statusText <- runGit ["-C", destination, "submodule", "status"]
                 assert (not (null statusText)) "git submodule status should see the submodule"
+                submoduleSync repository
+                configText <- readFile (destination </> ".git" </> "config")
+                assert ("[submodule \"sub\"]" `isInfixOf` configText) "submodule sync should write a submodule section"
+                assert ("url = " `isInfixOf` configText) "submodule sync should write the URL"
 
 reportsStatus :: IO ()
 reportsStatus =

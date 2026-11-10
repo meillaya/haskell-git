@@ -1,9 +1,12 @@
 module Git.Merge
-    ( MergeResult (..)
+    ( MergeOptions (..)
+    , MergeResult (..)
+    , defaultMergeOptions
     , isAncestor
     , mergeAbort
     , mergeContinue
     , mergeRepository
+    , mergeRepositoryWith
     , mergeTextContent
     , requireMergeBase
     , treeOfCommit
@@ -22,6 +25,7 @@ import System.Directory
     )
 import System.FilePath ((</>), takeDirectory)
 import Git.Commit (commitCurrentIndex)
+import Git.Diff (mergeTextContent)
 import Git.Hash (ObjectId, objectIdFromHexFor, objectIdToHex)
 import Git.Index
     ( IndexEntry (..)
@@ -59,6 +63,15 @@ import Git.Store
     )
 import Git.Worktree (checkoutTree, resetHard)
 
+data MergeOptions = MergeOptions
+    { mergeNoFastForward :: Bool
+    , mergeFFOnly :: Bool
+    }
+    deriving (Eq, Show)
+
+defaultMergeOptions :: MergeOptions
+defaultMergeOptions = MergeOptions False False
+
 data MergeResult
     = MergeUpToDate
     | MergeFastForward ObjectId
@@ -69,7 +82,12 @@ data MergeResult
 -- | Merge a commit into the current HEAD. Clean merges are committed
 -- immediately; conflicts are left in the index for 'mergeContinue'.
 mergeRepository :: Repository -> Store -> ObjectId -> IO MergeResult
-mergeRepository repository store targetId = do
+mergeRepository = mergeRepositoryWith defaultMergeOptions
+
+-- | Merge with explicit fast-forward policy. A no-fast-forward merge always
+-- creates a merge commit; an ff-only merge refuses divergent histories.
+mergeRepositoryWith :: MergeOptions -> Repository -> Store -> ObjectId -> IO MergeResult
+mergeRepositoryWith mergeOptions repository store targetId = do
     headValue <- resolveHeadReference repository
     headId <-
         case headValue of
@@ -80,15 +98,30 @@ mergeRepository repository store targetId = do
         else do
             headIsAncestor <- isAncestor store headId targetId
             if headIsAncestor
-                then do
-                    updateHeadReference repository targetId
-                    checkoutTree repository store targetId
-                    pure (MergeFastForward targetId)
+                then
+                    if mergeNoFastForward mergeOptions
+                        then do
+                            writeMergeState repository headId targetId
+                            checkoutTree repository store targetId
+                            commitId <-
+                                commitCurrentIndex
+                                    repository
+                                    store
+                                    ("Merge commit " ++ objectIdToHex targetId ++ "\n")
+                            pure (MergeCreated commitId)
+                        else do
+                            updateHeadReference repository targetId
+                            checkoutTree repository store targetId
+                            pure (MergeFastForward targetId)
                 else do
                     targetIsAncestor <- isAncestor store targetId headId
                     if targetIsAncestor
                         then pure MergeUpToDate
                         else do
+                            when (mergeFFOnly mergeOptions) $
+                                ioError (userError "merge is not a fast-forward")
+                            when (mergeNoFastForward mergeOptions && mergeFFOnly mergeOptions) $
+                                ioError (userError "merge cannot be both --no-ff and --ff-only")
                             baseId <- requireMergeBase store headId targetId
                             headTree <- treeOfCommit store repository headId
                             targetTree <- treeOfCommit store repository targetId
@@ -96,13 +129,27 @@ mergeRepository repository store targetId = do
                             baseEntries <- flattenTree store baseTree
                             ourEntries <- flattenTree store headTree
                             theirEntries <- flattenTree store targetTree
-                            (resolved, conflicts) <-
+                            let baseMap = entryMap baseEntries
+                                ourMap = entryMap ourEntries
+                                theirMap = entryMap theirEntries
+                                (ourRenames, ourNormalized) = detectRenames baseMap ourMap
+                                (theirRenames, theirNormalized) = detectRenames baseMap theirMap
+                            (rawResolved, rawConflicts) <-
                                 mergeEntryMaps
                                     repository
                                     store
-                                    (entryMap baseEntries)
-                                    (entryMap ourEntries)
-                                    (entryMap theirEntries)
+                                    baseMap
+                                    ourNormalized
+                                    theirNormalized
+                            let (resolved, renameConflicts) =
+                                    repathEntries
+                                        baseMap
+                                        ourRenames
+                                        theirRenames
+                                        rawResolved
+                                conflicts =
+                                    rawConflicts
+                                        ++ renameConflicts
                             treeId <-
                                 if null resolved
                                     then writeLooseObject repository (treeToObject [])
@@ -128,6 +175,109 @@ mergeRepository repository store targetId = do
                                 else pure (MergeConflicted (map conflictPath conflicts))
   where
     entryMap = Map.fromList . map (\(path, entry) -> (path, entry))
+
+-- | Detect exact-content renames from base to one side. The side map is
+-- normalised back to the base path so the ordinary three-way merge can reason
+-- about content, while the rename map records where the result belongs.
+detectRenames
+    :: Map.Map FilePath TreeEntry
+    -> Map.Map FilePath TreeEntry
+    -> (Map.Map FilePath (FilePath, TreeEntry), Map.Map FilePath TreeEntry)
+detectRenames baseMap sideMap =
+    (renameMap, normalized)
+  where
+    deleted =
+        [ (basePath, entry)
+        | (basePath, entry) <- Map.toList baseMap
+        , Map.notMember basePath sideMap
+        , renameable entry
+        ]
+    added =
+        [ (sidePath, entry)
+        | (sidePath, entry) <- Map.toList sideMap
+        , Map.notMember sidePath baseMap
+        , renameable entry
+        ]
+    candidateMatches =
+        [ (basePath, sidePath, sideEntry)
+        | (basePath, baseEntry) <- deleted
+        , (sidePath, sideEntry) <- added
+        , treeEntryObjectId sideEntry == treeEntryObjectId baseEntry
+        ]
+    targetCounts =
+        Map.fromListWith
+            (+)
+            [(sidePath, 1 :: Int) | (_, sidePath, _) <- candidateMatches]
+    matches =
+        [ (basePath, (sidePath, entry))
+        | (basePath, sidePath, entry) <- candidateMatches
+        , Map.findWithDefault 0 sidePath targetCounts == 1
+        ]
+    renameMap = Map.fromList matches
+    renamedTargets = Set.fromList [sidePath | (_, (sidePath, _)) <- matches]
+    withoutTargets =
+        foldr Map.delete sideMap (Set.toList renamedTargets)
+    normalized =
+        Map.union
+            (Map.fromList [(basePath, entry) | (basePath, (_, entry)) <- matches])
+            withoutTargets
+
+renameable :: TreeEntry -> Bool
+renameable entry =
+    treeEntryMode entry `elem` [RegularFile, ExecutableFile, Symlink]
+
+-- | Rewrite resolved paths according to the rename maps. When both sides
+-- rename the same path to different destinations, or a rename collides with
+-- another resolved path, the path becomes a conflict.
+repathEntries
+    :: Map.Map FilePath TreeEntry
+    -> Map.Map FilePath (FilePath, TreeEntry)
+    -> Map.Map FilePath (FilePath, TreeEntry)
+    -> [IndexEntry]
+    -> ([IndexEntry], [Conflict])
+repathEntries baseMap ourRenames theirRenames entries =
+    let (resolvedMap, conflicts) = foldl step (Map.empty, []) entries
+     in (Map.elems resolvedMap, conflicts)
+  where
+    step (resolvedMap, conflicts) entry =
+        case choosePath (BS8.unpack (indexEntryPath entry)) of
+            Nothing ->
+                let path = BS8.unpack (indexEntryPath entry)
+                 in ( resolvedMap
+                    , conflicts
+                        ++ [ Conflict
+                                path
+                                (Map.lookup path baseMap)
+                                (snd <$> Map.lookup path ourRenames)
+                                (snd <$> Map.lookup path theirRenames)
+                           ]
+                    )
+            Just newPath ->
+                let renamedEntry = entry {indexEntryPath = BS8.pack newPath}
+                 in case Map.lookup newPath resolvedMap of
+                    Nothing -> (Map.insert newPath renamedEntry resolvedMap, conflicts)
+                    Just existing
+                        | existing == entry -> (resolvedMap, conflicts)
+                        | otherwise ->
+                            ( resolvedMap
+                            , conflicts
+                                ++ [ Conflict
+                                        newPath
+                                        (Map.lookup (BS8.unpack (indexEntryPath entry)) baseMap)
+                                        Nothing
+                                        Nothing
+                                   ]
+                            )
+
+    choosePath path =
+        case (Map.lookup path ourRenames, Map.lookup path theirRenames) of
+            (Just (ourPath, ourEntry), Just (theirPath, theirEntry))
+                | ourPath == theirPath -> Just ourPath
+                | otherwise ->
+                    Nothing
+            (Just (ourPath, _), Nothing) -> Just ourPath
+            (Nothing, Just (theirPath, _)) -> Just theirPath
+            (Nothing, Nothing) -> Just path
 
 data Conflict = Conflict
     { conflictPath :: FilePath
@@ -213,16 +363,6 @@ readBlob store entry = do
     case gitObjectType gitObjectValue of
         BlobObject -> pure (gitObjectPayload gitObjectValue)
         _ -> ioError (userError "merge expected a blob")
-
-mergeTextContent :: BS.ByteString -> BS.ByteString -> BS.ByteString -> Either () BS.ByteString
-mergeTextContent base ours theirs
-    | ours == base = Right theirs
-    | theirs == base = Right ours
-    | ours == theirs = Right ours
-    | isBinary base || isBinary ours || isBinary theirs = Left ()
-    | otherwise = Left ()
-  where
-    isBinary bytes = BS.elem 0 (BS.take 8000 bytes)
 
 conflictIndexEntries :: Conflict -> [IndexEntry]
 conflictIndexEntries conflict =

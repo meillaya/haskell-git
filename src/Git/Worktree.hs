@@ -31,6 +31,7 @@ import System.Directory
     )
 import System.FilePath ((</>), takeDirectory)
 import Git.Hash (ObjectId)
+import Git.Ignore (isIgnored, loadIgnoreRules)
 import Git.Index
     ( IndexEntry (..)
     , indexEntryFromTree
@@ -241,8 +242,18 @@ statusRepository :: Repository -> Store -> IO [String]
 statusRepository repository store = do
     headEntries <- currentTreeEntries store repository
     indexEntries <- readIndexEntries repository
-    worktree <- worktreeEntries repository
-    let headMap = headMapOf headEntries
+    ignoreRules <- loadIgnoreRules repository
+    allWorktree <- worktreeEntries repository
+    let trackedPaths =
+            Set.fromList
+                ( map (BS8.unpack . indexEntryPath) indexEntries
+                    ++ map fst headEntries
+                )
+        worktree =
+            Map.filterWithKey
+                (\path _ -> Set.member path trackedPaths || not (isIgnored ignoreRules path))
+                allWorktree
+        headMap = headMapOf headEntries
         indexMap =
             Map.fromList
                 [ (BS8.unpack (indexEntryPath entry), (indexEntryMode entry, indexEntryObjectId entry))

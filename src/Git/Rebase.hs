@@ -3,6 +3,7 @@ module Git.Rebase
     , rebaseAbort
     , rebaseContinue
     , rebaseRepository
+    , rebaseRepositoryOnto
     , rebaseSkip
     ) where
 
@@ -91,7 +92,26 @@ data RebaseState = RebaseState
     }
 
 rebaseRepository :: Repository -> Store -> ObjectId -> IO RebaseResult
-rebaseRepository repository store onto = do
+rebaseRepository repository store onto =
+    rebaseRepositoryInternal repository store onto Nothing
+
+-- | Replay the commits after @upstream@ onto @onto@, as @git rebase --onto@.
+rebaseRepositoryOnto
+    :: Repository
+    -> Store
+    -> ObjectId
+    -> ObjectId
+    -> IO RebaseResult
+rebaseRepositoryOnto repository store onto upstream =
+    rebaseRepositoryInternal repository store onto (Just upstream)
+
+rebaseRepositoryInternal
+    :: Repository
+    -> Store
+    -> ObjectId
+    -> Maybe ObjectId
+    -> IO RebaseResult
+rebaseRepositoryInternal repository store onto maybeUpstream = do
     headReference <- readHeadReference repository
     branchPath <-
         case headReference of
@@ -102,35 +122,46 @@ rebaseRepository repository store onto = do
         case headValue of
             Nothing -> ioError (userError "cannot rebase an unborn branch")
             Just value -> pure value
-    ontoIsAncestor <- isAncestor store onto headId
-    if headId == onto || ontoIsAncestor
-        then pure RebaseUpToDate
-        else do
-            headIsAncestor <- isAncestor store headId onto
-            if headIsAncestor
-                then do
-                    writeRefValue repository branchPath onto
-                    writeHeadReference repository (SymbolicHead branchPath)
-                    checkoutTree repository store onto
-                    pure (RebaseComplete onto)
+    case maybeUpstream of
+        Just upstream -> do
+            if headId == onto
+                then pure RebaseUpToDate
                 else do
-                    base <- requireMergeBase store headId onto
-                    commits <- commitsAfter store headId base
-                    case commits of
-                        [] -> pure RebaseUpToDate
-                        firstCommit : rest -> do
-                            writeHeadReference repository (DetachedHead onto)
+                    commits <- commitsAfter store headId upstream
+                    startReplay branchPath headId onto commits
+        Nothing -> do
+            ontoIsAncestor <- isAncestor store onto headId
+            if headId == onto || ontoIsAncestor
+                then pure RebaseUpToDate
+                else do
+                    headIsAncestor <- isAncestor store headId onto
+                    if headIsAncestor
+                        then do
+                            writeRefValue repository branchPath onto
+                            writeHeadReference repository (SymbolicHead branchPath)
                             checkoutTree repository store onto
-                            let state =
-                                    RebaseState
-                                        { rebaseBranch = branchPath
-                                        , rebaseOrigHead = headId
-                                        , rebaseOnto = onto
-                                        , rebaseCurrent = Just firstCommit
-                                        , rebaseRemaining = rest
-                                        }
-                            saveState repository state
-                            replay repository store state
+                            pure (RebaseComplete onto)
+                        else do
+                            base <- requireMergeBase store headId onto
+                            commits <- commitsAfter store headId base
+                            startReplay branchPath headId onto commits
+  where
+    startReplay branchPath headId onto commits =
+        case commits of
+            [] -> pure RebaseUpToDate
+            firstCommit : rest -> do
+                writeHeadReference repository (DetachedHead onto)
+                checkoutTree repository store onto
+                let state =
+                        RebaseState
+                            { rebaseBranch = branchPath
+                            , rebaseOrigHead = headId
+                            , rebaseOnto = onto
+                            , rebaseCurrent = Just firstCommit
+                            , rebaseRemaining = rest
+                            }
+                saveState repository state
+                replay repository store state
 
 replay :: Repository -> Store -> RebaseState -> IO RebaseResult
 replay repository store state =
@@ -430,7 +461,7 @@ removeRebaseDir repository = do
     when exists (removePathForcibly directory)
 
 commitsAfter :: Store -> ObjectId -> ObjectId -> IO [ObjectId]
-commitsAfter store start stop = reverse <$> go [] start
+commitsAfter store start stop = go [] start
   where
     go accumulated current
         | current == stop = pure accumulated

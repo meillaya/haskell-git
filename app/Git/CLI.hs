@@ -68,10 +68,12 @@ import Git.Object.Loose (objectIdForObjectFor, writeLooseObject)
 import Git.Object.Person (PersonIdent)
 import Git.Object.Tag (tagFromObjectFor, tagObject)
 import Git.Merge
-    ( MergeResult (..)
+    ( MergeOptions (..)
+    , MergeResult (..)
+    , defaultMergeOptions
     , mergeAbort
     , mergeContinue
-    , mergeRepository
+    , mergeRepositoryWith
     )
 import Git.Object.Tree
     ( TreeEntry (..)
@@ -79,12 +81,13 @@ import Git.Object.Tree
     , renderTreeEntry
     , treeFromObjectFor
     )
-import Git.Pull (pullRepository, pullRepositoryRebase)
+import Git.Pull (pullRepository, pullRepositoryRebase, pullRepositoryWith)
 import Git.Rebase
     ( RebaseResult (..)
     , rebaseAbort
     , rebaseContinue
     , rebaseRepository
+    , rebaseRepositoryOnto
     , rebaseSkip
     )
 import Git.Push
@@ -124,6 +127,7 @@ import Git.Submodule
     ( initialiseSubmodules
     , readSubmodules
     , submoduleStatus
+    , submoduleSync
     , updateSubmodules
     )
 import Git.Verify (VerifyReport (..), renderVerifyReport, verifyRepository)
@@ -182,6 +186,7 @@ data Command
     | CommitCommand String
     | PullCommand String FetchOptions
     | PullRebaseCommand String
+    | PullFFOnlyCommand String
     | RebaseCommand RebaseAction
     | SubmoduleCommand SubmoduleAction
     | RemoteCommand RemoteAction
@@ -190,12 +195,13 @@ data Command
     | VersionCommand
 
 data MergeAction
-    = MergeRevision String
+    = MergeRevision String MergeOptions
     | MergeAbort
     | MergeContinue
 
 data RebaseAction
     = RebaseRevision String
+    | RebaseOnto String String
     | RebaseAbort
     | RebaseContinue
     | RebaseSkip
@@ -203,6 +209,7 @@ data RebaseAction
 data SubmoduleAction
     = SubmoduleStatus
     | SubmoduleUpdate Bool
+    | SubmoduleSync
 
 data RemoteAction
     = RemoteAdd String String
@@ -319,9 +326,9 @@ parseFetch arguments = do
     go options positionals ("--prune" : rest) =
         go (options {fetchPrune = True}) positionals rest
     go options positionals ("--tags" : rest) =
-        go (options {fetchTags = True}) positionals rest
+        go (options {fetchTags = True, fetchNoTags = False}) positionals rest
     go options positionals ("--no-tags" : rest) =
-        go (options {fetchTags = False}) positionals rest
+        go (options {fetchTags = False, fetchNoTags = True}) positionals rest
     go _ _ (argument : _)
         | "-" `isPrefixOf` argument =
             Left ("haskell-git: fetch does not understand " ++ argument)
@@ -342,6 +349,12 @@ parsePush arguments = do
         go (options {pushForce = True}) positionals rest
     go options positionals ("--delete" : rest) =
         go (options {pushDelete = True}) positionals rest
+    go options positionals ("--set-upstream" : rest) =
+        go (options {pushSetUpstream = True}) positionals rest
+    go options positionals ("-u" : rest) =
+        go (options {pushSetUpstream = True}) positionals rest
+    go options positionals ("--force-with-lease" : rest) =
+        go (options {pushForceWithLease = True}) positionals rest
     go _ _ (argument : _)
         | "-" `isPrefixOf` argument =
             Left ("haskell-git: push does not understand " ++ argument)
@@ -365,8 +378,22 @@ parseBranch _ = Left "haskell-git: usage: branch [<name>]"
 parseMerge :: [String] -> Either String Command
 parseMerge ["--abort"] = Right (MergeCommand MergeAbort)
 parseMerge ["--continue"] = Right (MergeCommand MergeContinue)
-parseMerge [revision] = Right (MergeCommand (MergeRevision revision))
-parseMerge _ = Left "haskell-git: usage: merge [--abort|--continue] <revision>"
+parseMerge arguments = do
+    (options, positionals) <- go defaultMergeOptions [] arguments
+    case positionals of
+        [revision] -> Right (MergeCommand (MergeRevision revision options))
+        _ -> Left "haskell-git: usage: merge [--no-ff|--ff-only] [--abort|--continue] <revision>"
+  where
+    go options positionals [] = Right (options, reverse positionals)
+    go options positionals ("--no-ff" : rest) =
+        go (options {mergeNoFastForward = True}) positionals rest
+    go options positionals ("--ff-only" : rest) =
+        go (options {mergeFFOnly = True}) positionals rest
+    go _ _ (argument : _)
+        | "-" `isPrefixOf` argument =
+            Left ("haskell-git: merge does not understand " ++ argument)
+    go options positionals (argument : rest) =
+        go options (argument : positionals) rest
 
 parseCommit :: [String] -> Either String Command
 parseCommit ["-m", message] = Right (CommitCommand message)
@@ -375,15 +402,20 @@ parseCommit _ = Left "haskell-git: usage: commit -m <message>"
 parsePull :: [String] -> Either String Command
 parsePull [] = Right (PullCommand "origin" defaultFetchOptions)
 parsePull ["--rebase"] = Right (PullRebaseCommand "origin")
+parsePull ["--ff-only"] = Right (PullFFOnlyCommand "origin")
+parsePull ["--ff-only", remote] = Right (PullFFOnlyCommand remote)
 parsePull [remote] = Right (PullCommand remote defaultFetchOptions)
-parsePull _ = Left "haskell-git: usage: pull [<remote>]"
+parsePull _ = Left "haskell-git: usage: pull [--rebase|--ff-only] [<remote>]"
 
 parseRebase :: [String] -> Either String Command
 parseRebase ["--abort"] = Right (RebaseCommand RebaseAbort)
 parseRebase ["--continue"] = Right (RebaseCommand RebaseContinue)
 parseRebase ["--skip"] = Right (RebaseCommand RebaseSkip)
 parseRebase [revision] = Right (RebaseCommand (RebaseRevision revision))
-parseRebase _ = Left "haskell-git: usage: rebase [--abort|--continue|--skip] <upstream>"
+parseRebase ["--onto", newBase, upstream] =
+    Right (RebaseCommand (RebaseOnto newBase upstream))
+parseRebase _ =
+    Left "haskell-git: usage: rebase [--abort|--continue|--skip] <upstream> | rebase --onto <newbase> <upstream>"
 
 parseClone :: Bool -> [String] -> Either String Command
 parseClone recursive [remoteUrl] = Right (CloneCommand recursive remoteUrl Nothing)
@@ -394,7 +426,8 @@ parseClone _ _ = Left "haskell-git: usage: clone [--recurse-submodules] <url> [<
 parseSubmodule :: [String] -> Either String Command
 parseSubmodule ["status"] = Right (SubmoduleCommand SubmoduleStatus)
 parseSubmodule ("update":rest) = Right (SubmoduleCommand (SubmoduleUpdate ("--recursive" `elem` rest)))
-parseSubmodule _ = Left "haskell-git: usage: submodule status | submodule update --init [--recursive]"
+parseSubmodule ["sync"] = Right (SubmoduleCommand SubmoduleSync)
+parseSubmodule _ = Left "haskell-git: usage: submodule status | update --init [--recursive] | sync"
 
 parseRemote :: [String] -> Either String Command
 parseRemote [] = Right (RemoteCommand RemoteList)
@@ -536,8 +569,10 @@ usageText =
         , "  commit -m message                commit the index"
         , "  pull [remote]                    fetch and merge"
         , "  rebase [--abort|--continue|--skip] upstream"
+        , "  rebase --onto <newbase> <upstream>"
         , "                                   replay the current branch"
-        , "  submodule status|update --init   manage submodules"
+        , "  submodule status|update --init|sync"
+        , "                                   manage submodules"
         , "  remote add|set-url|get-url ...   manage remotes"
         , "  verify [path]                    check objects and references"
         ]
@@ -753,6 +788,22 @@ runCommand (FetchCommand remote refspecs options) = do
         Nothing -> putStrLn "Already up to date."
         Just _ -> pure ()
 
+runCommand (PullFFOnlyCommand remote) = do
+    repository <- requireRepository "."
+    result <-
+        pullRepositoryWith
+            defaultMergeOptions {mergeFFOnly = True}
+            repository
+            remote
+            defaultFetchOptions
+    case result of
+        MergeUpToDate -> putStrLn "Already up to date."
+        MergeFastForward objectId -> putStrLn ("Fast-forward to " ++ objectIdToHex objectId)
+        MergeCreated objectId -> putStrLn ("Merge commit " ++ objectIdToHex objectId)
+        MergeConflicted paths -> do
+            mapM_ (putStrLn . ("CONFLICT " ++)) paths
+            exitWith (ExitFailure 1)
+
 runCommand (PushCommand remote refspecs options) = do
     repository <- requireRepository "."
     result <- pushRepository repository remote refspecs options
@@ -826,10 +877,10 @@ runCommand (MergeCommand action) = do
         MergeContinue -> do
             _ <- mergeContinue repository store ""
             pure ()
-        MergeRevision revision -> do
+        MergeRevision revision mergeOptions -> do
             targetObject <- resolveObjectId repository store revision
             targetId <- peelToCommit (repositoryObjectFormat repository) store targetObject
-            result <- mergeRepository repository store targetId
+            result <- mergeRepositoryWith mergeOptions repository store targetId
             case result of
                 MergeUpToDate -> putStrLn "Already up to date."
                 MergeFastForward objectId ->
@@ -866,6 +917,13 @@ runCommand (RebaseCommand action) = do
     repository <- requireRepository "."
     store <- loadStore repository
     case action of
+        RebaseOnto newBase upstream -> do
+            newBaseObject <- resolveObjectId repository store newBase
+            upstreamObject <- resolveObjectId repository store upstream
+            newBaseId <- peelToCommit (repositoryObjectFormat repository) store newBaseObject
+            upstreamId <- peelToCommit (repositoryObjectFormat repository) store upstreamObject
+            result <- rebaseRepositoryOnto repository store newBaseId upstreamId
+            reportRebaseResult result
         RebaseAbort -> rebaseAbort repository store
         RebaseContinue -> do
             result <- rebaseContinue repository store
@@ -885,6 +943,7 @@ runCommand (SubmoduleCommand action) = do
     case action of
         SubmoduleStatus -> mapM_ putStrLn =<< submoduleStatus repository store
         SubmoduleUpdate recursive -> updateSubmodules repository store recursive
+        SubmoduleSync -> submoduleSync repository
 
 runCommand (RemoteCommand action) = do
     repository <- requireRepository "."
@@ -1228,7 +1287,7 @@ shortBranchName branchPath
     | otherwise = branchPath
 
 versionText :: String
-versionText = "0.2.0"
+versionText = "0.3.0"
 
 defaultBranchName :: String
 defaultBranchName = "main"

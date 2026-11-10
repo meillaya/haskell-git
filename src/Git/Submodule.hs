@@ -3,6 +3,7 @@ module Git.Submodule
     , initialiseSubmodules
     , readSubmodules
     , resolveSubmoduleUrl
+    , submoduleSync
     , submoduleStatus
     , updateSubmodules
     ) where
@@ -26,6 +27,7 @@ import System.FilePath
 import Git.Clone (cloneRepository)
 import Git.Config
     ( ConfigEntry (..)
+    , appendConfigValue
     , configEntries
     , configGet
     , loadRepositoryConfig
@@ -153,6 +155,18 @@ initialiseSubmodules repository store recursive = do
                 url <- resolveUrlFor repository submodule
                 initialiseOne repository recursive submodule url (treeEntryObjectId entry)
             _ -> pure ()
+
+-- | Refresh submodule URLs in .git/config from .gitmodules.
+submoduleSync :: Repository -> IO ()
+submoduleSync repository = do
+    submodules <- readSubmodules repository
+    forM_ submodules $ \submodule ->
+        appendConfigValue
+            repository
+            "submodule"
+            (Just (submoduleName submodule))
+            "url"
+            (submoduleUrl submodule)
 
 updateSubmodules :: Repository -> Store -> Bool -> IO ()
 updateSubmodules = initialiseSubmodules

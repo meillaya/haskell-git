@@ -17,14 +17,16 @@ import Git.Refs
     , writeRefValue
     )
 import Git.Repo (Repository, initRepository, repositoryGitDir)
+import System.Directory (doesFileExist)
 import System.FilePath ((</>))
-import TestSupport (assert, assertEqual, withTempDirectory)
+import TestSupport (assert, assertContains, assertEqual, withTempDirectory)
 
 -- | Check symbolic and detached HEAD, packed references, revision resolution,
 -- and that ref names that escape the repository are refused.
 run :: IO ()
 run = do
     symbolicAndDetached
+    writesReflogs
     packedReferences
     revisionResolution
     invalidNamesRejected
@@ -49,6 +51,21 @@ symbolicAndDetached =
         assertEqual (Just commitId) detachedCommit "A detached HEAD should resolve to its object id"
 
 -- | Read a packed-refs file and check a loose ref wins.
+writesReflogs :: IO ()
+writesReflogs =
+    withTempDirectory "haskell-git-reflog" $ \temporaryDir -> do
+        repository <- initRepository temporaryDir
+        commitId <- requireObjectId "716f9b16f57f2fb17e7e1d1bda17f4cc1f2ac27a"
+        writeRefValue repository "refs/heads/main" commitId
+        writeHeadReference repository (DetachedHead commitId)
+        branchLog <-
+            doesFileExist (repositoryGitDir repository </> "logs" </> "refs" </> "heads" </> "main")
+        headLog <- doesFileExist (repositoryGitDir repository </> "logs" </> "HEAD")
+        assertEqual True branchLog "Writing a branch should create its reflog"
+        assertEqual True headLog "Writing HEAD should create the HEAD reflog"
+        branchText <- readFile (repositoryGitDir repository </> "logs" </> "refs" </> "heads" </> "main")
+        assertContains (objectIdToHex commitId) branchText "The reflog should record the new object id"
+
 packedReferences :: IO ()
 packedReferences =
     withTempDirectory "haskell-git-packed-refs" $ \temporaryDir -> do

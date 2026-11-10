@@ -3,6 +3,7 @@ module Git.AuthSpec
     ) where
 
 import Control.Exception (IOException, try)
+import Data.List (isInfixOf)
 import Git.Clone (CloneResult (..), cloneRepository)
 import Git.Fetch (defaultFetchOptions, fetchRepository)
 import Git.Repo (Repository, findRepository)
@@ -62,7 +63,9 @@ rejectsWrongPassword =
             let wrongUrl = replaceCredentials remoteUrl "ada:wrong"
             result <- try (cloneRepository wrongUrl (temporaryDir </> "clone")) :: IO (Either IOException CloneResult)
             case result of
-                Left _ -> pure ()
+                Left err -> do
+                    let message = show err
+                    assert (not ("wrong" `isInfixOf` message)) "Authentication errors must not echo the password"
                 Right _ -> fail "A wrong password should not clone"
 
 clonesWithAskpass :: IO ()

@@ -5,14 +5,14 @@ module Git.Push
     , pushRepository
     ) where
 
-import Control.Monad (filterM, when)
+import Control.Monad (filterM, forM_, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
-import Data.List (isPrefixOf)
+import Data.List (isPrefixOf, stripPrefix)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Git.Config (Config, configGet, loadRepositoryConfig)
+import Git.Config (Config, appendConfigValue, configGet, loadRepositoryConfig)
 import Git.Hash
     ( HashAlgorithm
     , ObjectId
@@ -31,6 +31,13 @@ import Git.Object.Loose (objectIdForObjectFor)
 import Git.Object.Tag (tagFromObjectFor, tagObject)
 import Git.Object.Tree (treeEntryObjectId, treeFromObjectFor)
 import Git.Pack.Write (writePackFile)
+import Git.Refs
+    ( HeadReference (..)
+    , deleteRef
+    , readHeadReference
+    , readRefValue
+    , writeRefValue
+    )
 import Git.Protocol.PacketLine
     ( decodePacketLines
     , encodePacketLine
@@ -71,11 +78,13 @@ import Git.Transport
 data PushOptions = PushOptions
     { pushForce :: Bool
     , pushDelete :: Bool
+    , pushSetUpstream :: Bool
+    , pushForceWithLease :: Bool
     }
     deriving (Eq, Show)
 
 defaultPushOptions :: PushOptions
-defaultPushOptions = PushOptions False False
+defaultPushOptions = PushOptions False False False False
 
 data PushResult = PushResult
     { pushReportedRefs :: [(String, String)]
@@ -101,7 +110,7 @@ pushRepository repository remoteArgument explicitRefSpecs options = do
                     [ (bsToText (discoveryRefName ref), discoveryRefObjectId ref)
                     | ref <- filter (not . isPeeledRef) (discoveryRefs advertisement)
                     ]
-        updates <- buildUpdates repository store options (discoveryObjectFormat advertisement) remoteRefs explicitRefSpecs
+        updates <- buildUpdates repository store options (pushRemoteName remote) (discoveryObjectFormat advertisement) remoteRefs explicitRefSpecs
         if null updates
             then pure (PushResult [])
             else do
@@ -130,11 +139,10 @@ pushRepository repository remoteArgument explicitRefSpecs options = do
                     case parseReportStatus response of
                         Left err -> ioError (userError err)
                         Right reported -> pure (Just reported)
-                pure
-                    PushResult
-                        { pushReportedRefs =
-                            maybe [] id reportedRefs
-                        }
+                let reported = maybe [] id reportedRefs
+                updateTrackingRefs repository remote updates
+                when (pushSetUpstream options) (setUpstream repository remote updates)
+                pure (PushResult reported)
   where
     isPeeledRef ref = "^{}" `isSuffixOfText` bsToText (discoveryRefName ref)
 
@@ -153,18 +161,20 @@ data PushUpdate = PushUpdate
     , pushUpdateOld :: ObjectId
     , pushUpdateNew :: Maybe ObjectId
     }
+    deriving (Show)
 
 buildUpdates
     :: Repository
     -> Store
     -> PushOptions
+    -> String
     -> HashAlgorithm
     -> Map.Map String ObjectId
     -> [String]
     -> IO [PushUpdate]
-buildUpdates repository store options objectFormat remoteRefs explicitRefSpecs = do
+buildUpdates repository store options remoteName objectFormat remoteRefs explicitRefSpecs = do
     refspecs <- pushRefSpecs repository options explicitRefSpecs
-    updates <- traverse (buildUpdate store options objectFormat remoteRefs) refspecs
+    updates <- traverse (buildUpdate repository store options remoteName objectFormat remoteRefs) refspecs
     pure (filter somethingToDo updates)
   where
     somethingToDo update =
@@ -193,13 +203,15 @@ pushRefSpecs repository options explicitRefSpecs
     | otherwise = traverse (either (ioError . userError) pure . parseRefSpec) explicitRefSpecs
 
 buildUpdate
-    :: Store
+    :: Repository
+    -> Store
     -> PushOptions
+    -> String
     -> HashAlgorithm
     -> Map.Map String ObjectId
     -> RefSpec
     -> IO PushUpdate
-buildUpdate store options objectFormat remoteRefs refSpec
+buildUpdate repository store options remoteName objectFormat remoteRefs refSpec
     | null (refSpecSource refSpec) && pushDelete options =
         case refSpecDestination refSpec of
             Nothing -> ioError (userError "a delete refspec needs a destination")
@@ -222,12 +234,75 @@ buildUpdate store options objectFormat remoteRefs refSpec
             Nothing -> pure (PushUpdate destination oldId Nothing)
             Just newObjectId -> do
                 let force = pushForce options || refSpecForce refSpec
+                when (pushForceWithLease options && oldId /= zeroObjectIdFor objectFormat) $
+                    checkLease repository remoteName destination oldId
                 when (oldId /= zeroObjectIdFor objectFormat && not force) $ do
                     ancestor <- isAncestor store oldId newObjectId
                     if ancestor
                         then pure ()
                         else ioError (userError ("non-fast-forward update: " ++ destination))
                 pure (PushUpdate destination oldId (Just newObjectId))
+
+trackingRefFor :: String -> FilePath -> Maybe FilePath
+trackingRefFor remoteName destination =
+    case stripPrefix "refs/heads/" destination of
+        Just branch -> Just ("refs/remotes/" ++ remoteName ++ "/" ++ branch)
+        Nothing -> Nothing
+
+checkLease :: Repository -> String -> FilePath -> ObjectId -> IO ()
+checkLease repository remoteName destination oldId =
+    case trackingRefFor remoteName destination of
+        Nothing -> pure ()
+        Just trackingRef -> do
+            tracking <- readRefValue repository trackingRef
+            case tracking of
+                Just expected
+                    | expected == oldId -> pure ()
+                    | otherwise ->
+                        ioError
+                            ( userError
+                                ( "stale info: "
+                                    ++ trackingRef
+                                    ++ " does not match the remote"
+                                )
+                            )
+                Nothing ->
+                    ioError (userError ("stale info: " ++ trackingRef ++ " is missing"))
+
+updateTrackingRefs :: Repository -> Remote -> [PushUpdate] -> IO ()
+updateTrackingRefs repository remote updates =
+    forM_ updates $ \update ->
+        case trackingRefFor (pushRemoteName remote) (pushUpdateRef update) of
+            Nothing -> pure ()
+            Just trackingRef ->
+                case pushUpdateNew update of
+                    Just newId -> writeRefValue repository trackingRef newId
+                    Nothing -> deleteRef repository trackingRef
+
+setUpstream :: Repository -> Remote -> [PushUpdate] -> IO ()
+setUpstream repository remote updates =
+    case [branch | update <- updates, Just branch <- [pushedBranch update]] of
+        [] -> pure ()
+        pushedBranches -> do
+            headReference <- readHeadReference repository
+            let currentBranch =
+                    case headReference of
+                        SymbolicHead refPath -> stripPrefix "refs/heads/" refPath
+                        DetachedHead _ -> Nothing
+            case currentBranch of
+                Nothing -> pure ()
+                Just branch -> do
+                    appendConfigValue repository "branch" (Just branch) "remote" (pushRemoteName remote)
+                    let mergeRef =
+                            if branch `elem` pushedBranches
+                                then "refs/heads/" ++ branch
+                                else "refs/heads/" ++ head pushedBranches
+                    appendConfigValue repository "branch" (Just branch) "merge" mergeRef
+  where
+    pushedBranch update =
+        case pushUpdateNew update of
+            Nothing -> Nothing
+            Just _ -> stripPrefix "refs/heads/" (pushUpdateRef update)
 
 resolveRevisionInStore :: Store -> String -> IO ObjectId
 resolveRevisionInStore store revision = do
@@ -306,6 +381,10 @@ encodePushCommands objectFormat capabilities updates =
         | capability <- [BS8.pack "report-status", BS8.pack "delete-refs"]
         , capability `elem` capabilities
         ]
+            ++ [ capability
+               | capability <- capabilities
+               , BS8.pack "object-format=" `BS.isPrefixOf` capability
+               ]
     encodeUpdate index update =
         let oldId = objectIdToHex (pushUpdateOld update)
             newId = objectIdToHex (maybe (zeroObjectIdFor objectFormat) id (pushUpdateNew update))

@@ -2,6 +2,7 @@ module Git.FetchSpec
     ( run
     ) where
 
+import Data.List (isInfixOf)
 import Git.Clone (cloneRepository)
 import Git.Config
     ( configGet
@@ -35,6 +36,7 @@ run = do
     refSpecParsing
     fetchesNewCommit
     pullsFastForward
+    autoFollowsReachableTags
     fetchesAndPrunesBranches
 
 configParsing :: IO ()
@@ -148,6 +150,36 @@ pullsFastForward =
             assertEqual "pulled\n" contents "pull should check out the fetched file"
             statusText <- runGit ["-C", destination, "status", "--porcelain"]
             assertEqual "" statusText "pull should leave a clean worktree"
+
+autoFollowsReachableTags :: IO ()
+autoFollowsReachableTags =
+    withTempDirectory "haskell-git-fetch-tags" $ \temporaryDir -> do
+        let sourceDirectory = temporaryDir </> "source"
+            serveDirectory = temporaryDir </> "serve"
+            bareRepository = serveDirectory </> "repo.git"
+            destination = temporaryDir </> "clone"
+        _ <- createSource sourceDirectory
+        _ <- runGit ["-C", sourceDirectory, "checkout", "-q", "--orphan", "orphan"]
+        _ <- runGit ["-C", sourceDirectory, "rm", "-q", "-rf", "."]
+        writeFile (sourceDirectory </> "orphan.txt") "orphan\n"
+        _ <- runGit ["-C", sourceDirectory, "add", "-A"]
+        _ <- runGit ["-C", sourceDirectory, "commit", "-qm", "orphan"]
+        _ <- runGit ["-C", sourceDirectory, "-c", "tag.gpgSign=false", "tag", "orphan-tag"]
+        _ <- runGit ["-C", sourceDirectory, "checkout", "-q", "main"]
+        createDirectoryIfMissing True serveDirectory
+        _ <- runGit ["clone", "-q", "--bare", sourceDirectory, bareRepository]
+        _ <- runGit ["-C", bareRepository, "update-ref", "-d", "refs/heads/orphan"]
+        withHttpBackendServer serveDirectory "repo.git" $ \remoteUrl -> do
+            _ <- cloneRepository remoteUrl destination
+            repository <- requireRepository destination
+            _ <- runGit ["-C", destination, "update-ref", "-d", "refs/tags/orphan-tag"]
+            _ <- fetchRepository repository "origin" [] defaultFetchOptions
+            tagRefs <- runGit ["-C", destination, "show-ref", "--tags"]
+            assert ("refs/tags/v1" `isInfixOf` tagRefs) "auto-follow should fetch a tag reachable from a branch"
+            assert (not ("refs/tags/orphan-tag" `isInfixOf` tagRefs)) "auto-follow should skip unreachable tags"
+            _ <- fetchRepository repository "origin" [] defaultFetchOptions {fetchTags = True}
+            allTagRefs <- runGit ["-C", destination, "show-ref", "--tags"]
+            assert ("refs/tags/orphan-tag" `isInfixOf` allTagRefs) "--tags should fetch unreachable tags"
 
 fetchesAndPrunesBranches :: IO ()
 fetchesAndPrunesBranches =

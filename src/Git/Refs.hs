@@ -17,7 +17,8 @@ module Git.Refs
     , writeSymbolicRefValue
     ) where
 
-import Control.Monad (forM)
+import Control.Exception (bracket, catch)
+import Control.Monad (forM, when)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (mapMaybe)
 import Git.Hash (HashAlgorithm, ObjectId, objectIdFromHexFor, objectIdToHex)
@@ -30,14 +31,23 @@ import Git.Repo
     )
 import System.Directory
     ( createDirectoryIfMissing
+    , removeFile
     , doesDirectoryExist
     , doesFileExist
     , listDirectory
-    , removeFile
     , renameFile
     )
 import System.FilePath ((</>), takeDirectory, takeFileName)
 import System.IO (hClose, hPutStr, openTempFile)
+import System.IO.Error (catchIOError)
+import System.Posix.IO
+    ( OpenMode (WriteOnly)
+    , closeFd
+    , defaultFileFlags
+    , openFd
+    , OpenFileFlags (creat, exclusive, trunc)
+    )
+import Git.Reflog (appendReflog)
 
 data HeadReference
     = SymbolicHead FilePath
@@ -54,13 +64,20 @@ headPath :: Repository -> FilePath
 headPath repository = repositoryGitDir repository </> headRefPath
 
 writeHeadReference :: Repository -> HeadReference -> IO ()
-writeHeadReference repository headReference =
+writeHeadReference repository headReference = do
+    oldValue <- resolveHeadReference repository
+    newValue <-
+        case headReference of
+            SymbolicHead refPath -> resolveRevision repository refPath
+            DetachedHead objectId -> pure (Just objectId)
     case headReference of
         SymbolicHead refPath -> do
             validateRefPath refPath
             writeFileAtomically (headPath repository) ("ref: " ++ refPath ++ "\n")
         DetachedHead objectId ->
             writeFileAtomically (headPath repository) (objectIdToHex objectId ++ "\n")
+    when (oldValue /= Nothing || newValue /= Nothing) $
+        appendReflog repository headRefPath oldValue newValue "checkout: moving HEAD"
 
 readHeadReference :: Repository -> IO HeadReference
 readHeadReference repository = do
@@ -79,6 +96,7 @@ deleteRef repository refPath = do
     let loosePath = repositoryGitDir repository </> refPath
     looseExists <- doesFileExist loosePath
     if looseExists then removeFile loosePath else pure ()
+    removeRefLog repository refPath
     let packedPath = repositoryPackedRefsPath repository
     packedExists <- doesFileExist packedPath
     if packedExists
@@ -101,9 +119,12 @@ deleteRef repository refPath = do
 writeRefValue :: Repository -> FilePath -> ObjectId -> IO ()
 writeRefValue repository refPath objectId = do
     validateRefPath refPath
+    oldValue <- readRefValue repository refPath
     let fullPath = repositoryGitDir repository </> refPath
     createDirectoryIfMissing True (takeDirectory fullPath)
     writeFileAtomically fullPath (objectIdToHex objectId ++ "\n")
+    when (shouldLogRef refPath) $
+        appendReflog repository refPath oldValue (Just objectId) "update by haskell-git"
 
 -- | Read a loose reference. Packed references are read by 'listRefs'; use
 -- 'resolveRevision' or 'lookupRef' when both kinds should be considered.
@@ -119,11 +140,13 @@ readRefValue repository refPath
 
 updateHeadReference :: Repository -> ObjectId -> IO ()
 updateHeadReference repository objectId = do
+    oldValue <- resolveHeadReference repository
     headReference <- readHeadReference repository
     case headReference of
         SymbolicHead refPath -> writeRefValue repository refPath objectId
         DetachedHead _ ->
             writeFileAtomically (headPath repository) (objectIdToHex objectId ++ "\n")
+    appendReflog repository headRefPath oldValue (Just objectId) "update by haskell-git"
 
 -- | Write a symbolic reference, such as @refs/remotes/origin/HEAD@, which
 -- points at another reference instead of an object.
@@ -266,16 +289,42 @@ readReferenceFile objectFormat path = do
 writeFileAtomically :: FilePath -> String -> IO ()
 writeFileAtomically path contents = do
     createDirectoryIfMissing True (takeDirectory path)
-    (temporaryPath, handle) <- openTempFile (takeDirectory path) (takeFileName path ++ ".tmp")
-    hPutStr handle contents
-    hClose handle
-    renameFile temporaryPath path
+    withRefLock path $ do
+        (temporaryPath, handle) <- openTempFile (takeDirectory path) (takeFileName path ++ ".tmp")
+        hPutStr handle contents
+        hClose handle
+        renameFile temporaryPath path
+
+withRefLock :: FilePath -> IO a -> IO a
+withRefLock path action = bracket acquire release (const action)
+  where
+    lockPath = path ++ ".lock"
+    acquire =
+        openFd
+            lockPath
+            WriteOnly
+            defaultFileFlags {exclusive = True, trunc = True, creat = Just 0o644}
+    release descriptor = do
+        closeFd descriptor
+        removeFile lockPath `catchIOError` \_ -> pure ()
 
 validateRefPath :: FilePath -> IO ()
 validateRefPath refPath =
     case validateReferenceName refPath of
         Left err -> ioError (userError err)
         Right () -> pure ()
+
+shouldLogRef :: FilePath -> Bool
+shouldLogRef refPath =
+    refPath == "HEAD" || "refs/heads/" `isPrefixOfRef` refPath
+
+isPrefixOfRef :: String -> String -> Bool
+isPrefixOfRef prefix text = take (length prefix) text == prefix
+
+removeRefLog :: Repository -> FilePath -> IO ()
+removeRefLog repository refPath =
+    removeFile (repositoryGitDir repository </> "logs" </> refPath)
+        `catchIOError` \_ -> pure ()
 
 maxSymbolicDepth :: Int
 maxSymbolicDepth = 10

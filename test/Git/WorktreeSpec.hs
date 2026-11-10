@@ -28,6 +28,7 @@ run :: IO ()
 run = do
     checksOutAnotherBranch
     reportsDirtyStatus
+    ignoresUntrackedFiles
     resetsHard
 
 checksOutAnotherBranch :: IO ()
@@ -65,6 +66,25 @@ reportsDirtyStatus =
         assert ("?? untracked.txt" `elem` untrackedStatus) "An untracked file should be reported"
         _ <- runBash ("git -C " ++ show temporaryDir ++ " checkout -q -- main.txt")
         pure ()
+
+ignoresUntrackedFiles :: IO ()
+ignoresUntrackedFiles =
+    withTempDirectory "haskell-git-status-ignore" $ \temporaryDir -> do
+        _ <- createRepository temporaryDir
+        writeFile
+            (temporaryDir </> ".gitignore")
+            "*.o\nbuild/\n!keep.o\n"
+        writeFile (temporaryDir </> "ignored.o") "object\n"
+        writeFile (temporaryDir </> "keep.o") "keep\n"
+        createDirectoryIfMissing True (temporaryDir </> "build")
+        writeFile (temporaryDir </> "build" </> "artifact") "built\n"
+        repository <- requireRepository temporaryDir
+        store <- loadStore repository
+        status <- statusRepository repository store
+        assert (not ("?? ignored.o" `elem` status)) "*.o should be ignored"
+        assert (not ("?? build/artifact" `elem` status)) "build/ should be ignored"
+        assert ("?? keep.o" `elem` status) "A later negation should unignore keep.o"
+        assert ("?? .gitignore" `elem` status) ".gitignore itself should still be visible"
 
 resetsHard :: IO ()
 resetsHard =

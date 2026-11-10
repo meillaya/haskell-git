@@ -260,25 +260,28 @@ out, and pack index tables are loaded in full.
   dual-hash `compatObjectFormat` repository is refused.
 - Pack files are streamed, but a single object is held in memory while it is
   read. Pack index tables are loaded in full.
-- Submodules are initialised with `clone --recurse-submodules` and
-  `submodule update --init [--recursive]`; `submodule add`, `deinit`,
-  `foreach`, and `absorbgitdirs` are not implemented. A normal clone still
-  leaves empty submodule directories, matching git.
+- Submodules are initialised with `clone --recurse-submodules`,
+  `submodule update --init [--recursive]`, and `submodule sync`; `submodule
+  add`, `deinit`, `foreach`, and `absorbgitdirs` are not implemented. A normal
+  clone still leaves empty submodule directories, matching git.
 - `fetch`, `push`, `pull`, `merge`, `rebase`, `checkout`, `switch`, `branch`,
-  `status`, and `reset --hard` are implemented. Interactive rebase, octopus
-  merges, rename-aware merges, reflogs, hooks, signed-commit verification,
-  shallow/partial clone, LFS, and Windows remain out of scope. Convenience
-  flags such as `merge --no-ff`, `rebase --onto`, and `push --set-upstream` are
-  also not implemented.
-- Merge resolves changes at file granularity. If both sides modify the same
-  file, it reports a conflict rather than attempting a line-level diff3. It
-  does not detect renames.
-- Fetch asks for the needed tips and receives a full pack; it does not yet send
-  `have` lines for a compact negotiation.
-- Push works over Smart HTTP and SSH. `git://` receive-pack is not enabled
-  (the git daemon normally disables it).
-- `status` does not evaluate `.gitignore`; untracked files are reported without
-  ignore filtering. `submodule sync` is not implemented.
+  `status`, and `reset --hard` are implemented, including `merge --no-ff`,
+  `merge --ff-only`, `pull --ff-only`, `rebase --onto`, `push
+  --set-upstream`, and `push --force-with-lease`. Interactive rebase, octopus
+  merges, hooks, signed-commit verification, shallow/partial clone, LFS, and
+  Windows remain out of scope.
+- Merge uses a line-level diff3 and detects exact-content renames. Renames
+  whose contents also changed are not detected, and conflicts are still
+  resolved at file granularity.
+- Fetch sends `have` lines for a compact negotiation and auto-follows tags
+  reachable from fetched branches; `--tags` fetches every tag. Protocol v2 is
+  not implemented.
+- Push works over Smart HTTP, SSH, and git:// (the daemon must enable
+  receive-pack).
+- Reflogs are written for `HEAD` and local branches with generic
+  `haskell-git` messages; they are not yet written by hooks or external tools.
+- `status` evaluates root `.gitignore` and `.git/info/exclude`; nested
+  `.gitignore` files are not yet consulted.
 
 ## Tests
 
@@ -292,8 +295,11 @@ The suite uses git as the reference. Integration tests start real
 `git status`, `git fsck --strict`, `git ls-tree`, and `git submodule status`.
 Unit tests cover the codecs, the streaming pack reader, delta resolution,
 index stages, fetch/push protocols, merge and rebase, and corrupted objects.
+A property-style round-trip test exercises the pack writer and streaming
+reader for both SHA-1 and SHA-256. The clone path is also exercised against
+large public repositories during release validation.
 
 `devenv shell -- unit-test` runs the same suite from the shell, and
 `devenv shell -- check` adds `cabal check`. `scripts/memory-benchmark.sh`
 builds a large packed repository and checks the peak memory of `clone` and
-`verify`.
+`verify`. The GitHub Actions workflow runs the suite on GHC 9.6 and 9.10.

@@ -4,7 +4,15 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-bin=${HASKELL_GIT:-$root/dist-newstyle/build/x86_64-linux/ghc-9.10.3/haskell-git-0.2.0.0/x/haskell-git/build/haskell-git/haskell-git}
+if [ -z "${HASKELL_GIT:-}" ]; then
+    bin=$(find "$root/dist-newstyle" -type f -path '*/x/haskell-git/build/haskell-git/haskell-git' 2>/dev/null | sort | tail -1)
+else
+    bin=$HASKELL_GIT
+fi
+if [ ! -x "$bin" ]; then
+    echo "build the executable first, or set HASKELL_GIT" >&2
+    exit 1
+fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 

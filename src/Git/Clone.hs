@@ -108,6 +108,7 @@ cloneInto remoteUrl destination = do
                         transport
                         (discoveryCapabilities advertisement)
                         wantedIds
+                        []
                         packPath
                     importPackFile objectFormat repository packPath
                 store <- loadStore repository

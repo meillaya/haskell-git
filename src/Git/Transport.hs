@@ -15,6 +15,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (isSpace)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe)
 import Network.HTTP.Client
@@ -112,7 +113,7 @@ data RemoteUrl
 
 data Transport = Transport
     { transportDiscovery :: Service -> IO DiscoveryAdvertisement
-    , transportUploadPackToFile :: [ByteString] -> [ObjectId] -> FilePath -> IO ()
+    , transportUploadPackToFile :: [ByteString] -> [ObjectId] -> [ObjectId] -> FilePath -> IO ()
     , transportReceivePack :: ByteString -> Maybe FilePath -> IO ByteString
     }
 
@@ -222,8 +223,8 @@ withSshTransport config remote action = do
                 { transportDiscovery =
                     \service -> sshDiscovery command baseArguments remote service
                 , transportUploadPackToFile =
-                    \caps wants destination ->
-                        sshUploadPack command baseArguments remote caps wants destination
+                    \caps wants haves destination ->
+                        sshUploadPack command baseArguments remote caps wants haves destination
                 , transportReceivePack =
                     \commands maybePack ->
                         sshReceivePack command baseArguments remote commands maybePack
@@ -316,13 +317,14 @@ sshUploadPack
     -> RemoteUrl
     -> [ByteString]
     -> [ObjectId]
+    -> [ObjectId]
     -> FilePath
     -> IO ()
-sshUploadPack command arguments remote advertisedCapabilities wantedIds destination = do
+sshUploadPack command arguments remote advertisedCapabilities wantedIds haves destination = do
     (inputHandle, outputHandle, processHandle) <-
         sshStartProcess command arguments remote UploadPackService
     _ <- readRefAdvertisementFromHandle outputHandle
-    BS.hPut inputHandle (encodeWantRequest advertisedCapabilities wantedIds)
+    BS.hPut inputHandle (encodeWantRequest advertisedCapabilities wantedIds haves)
     hFlush inputHandle
     hClose inputHandle
     writeUploadResponseFromHandle outputHandle destination
@@ -392,36 +394,135 @@ readRefAdvertisementFromHandle handle = go []
 
 writeUploadResponseFromHandle :: Handle -> FilePath -> IO ()
 writeUploadResponseFromHandle handle destination =
-    withBinaryFile destination WriteMode $ \outputHandle -> do
-        prefix <- BS.hGet handle 8
-        if BS8.isPrefixOf (BS8.pack "PACK") prefix
-            then do
-                BS.hPut outputHandle prefix
-                copyHandle handle outputHandle
-            else
-                if BS8.isPrefixOf (BS8.pack "0008NAK\n") prefix
-                    then do
-                        BS.hPut outputHandle (BS.drop 8 prefix)
-                        copyHandle handle outputHandle
-                    else
-                        case pktLineError prefix of
-                            Just message -> ioError (userError ("remote error: " ++ message))
-                            Nothing ->
-                                ioError
-                                    ( userError
-                                        ( "unexpected upload-pack response: "
-                                            ++ BS8.unpack (BS.take 60 prefix)
-                                        )
-                                    )
+    writeUploadResponse (handleSource handle) destination
 
-copyHandle :: Handle -> Handle -> IO ()
-copyHandle inputHandle outputHandle = do
-    chunk <- BS.hGetSome inputHandle 32
+handleSource :: Handle -> ByteSource
+handleSource handle = ByteSource (BS.hGetSome handle 32768)
+
+writeUploadResponse :: ByteSource -> FilePath -> IO ()
+writeUploadResponse source destination =
+    withBinaryFile destination WriteMode $ \outputHandle -> do
+        buffered <- newBufferedSource source
+        loop buffered outputHandle
+  where
+    loop buffered outputHandle = do
+        prefix <- peekExact buffered 4
+        case prefix of
+            Left err -> ioError (userError err)
+            Right prefixBytes
+                | prefixBytes == BS8.pack "PACK" ->
+                    writeBuffered buffered outputHandle
+                | otherwise ->
+                    case parsePacketLength prefixBytes of
+                        Nothing ->
+                            ioError
+                                ( userError
+                                    ( "unexpected upload-pack response: "
+                                        ++ BS8.unpack (BS.take 60 prefixBytes)
+                                    )
+                                )
+                        Just 0 -> do
+                            _ <- takeExact buffered 4
+                            loop buffered outputHandle
+                        Just packetLength -> do
+                            packet <- takeExact buffered packetLength
+                            case packet of
+                                Left err -> ioError (userError err)
+                                Right packetBytes ->
+                                    let payload = BS.drop 4 packetBytes
+                                     in if BS8.pack "ERR " `BS8.isPrefixOf` payload
+                                            then
+                                                ioError
+                                                    ( userError
+                                                        ( "remote error: "
+                                                            ++ BS8.unpack (BS.drop 4 payload)
+                                                        )
+                                                    )
+                                            else
+                                                if BS8.pack "ACK " `BS8.isPrefixOf` payload
+                                                    || BS8.pack "NAK" `BS8.isPrefixOf` payload
+                                                    then loop buffered outputHandle
+                                                    else
+                                                        ioError
+                                                            ( userError
+                                                                ( "unexpected upload-pack packet: "
+                                                                    ++ BS8.unpack (BS.take 60 payload)
+                                                                )
+                                                            )
+
+newtype ByteSource = ByteSource (IO ByteString)
+
+data BufferedSource = BufferedSource
+    { bufferedSource :: ByteSource
+    , bufferedPending :: IORef ByteString
+    }
+
+newBufferedSource :: ByteSource -> IO BufferedSource
+newBufferedSource source = do
+    pending <- newIORef BS.empty
+    pure (BufferedSource source pending)
+
+peekExact :: BufferedSource -> Int -> IO (Either String ByteString)
+peekExact buffered count = do
+    filled <- fillBuffer buffered count
+    if filled < count
+        then pure (Left "unexpected end of upload-pack response")
+        else do
+            pending <- readIORef (bufferedPending buffered)
+            pure (Right (BS.take count pending))
+
+takeExact :: BufferedSource -> Int -> IO (Either String ByteString)
+takeExact buffered count = do
+    filled <- fillBuffer buffered count
+    if filled < count
+        then pure (Left "unexpected end of upload-pack response")
+        else do
+            pending <- readIORef (bufferedPending buffered)
+            let (taken, rest) = BS.splitAt count pending
+            writeIORef (bufferedPending buffered) rest
+            pure (Right taken)
+
+fillBuffer :: BufferedSource -> Int -> IO Int
+fillBuffer buffered count = do
+    pending <- readIORef (bufferedPending buffered)
+    if BS.length pending >= count
+        then pure (BS.length pending)
+        else do
+            next <- sourceRead (bufferedSource buffered)
+            if BS.null next
+                then pure (BS.length pending)
+                else do
+                    writeIORef (bufferedPending buffered) (pending <> next)
+                    fillBuffer buffered count
+
+sourceRead :: ByteSource -> IO ByteString
+sourceRead (ByteSource action) = action
+
+writeBuffered :: BufferedSource -> Handle -> IO ()
+writeBuffered buffered outputHandle = do
+    pending <- readIORef (bufferedPending buffered)
+    BS.hPut outputHandle pending
+    writeIORef (bufferedPending buffered) BS.empty
+    copySource (bufferedSource buffered) outputHandle
+
+copySource :: ByteSource -> Handle -> IO ()
+copySource source outputHandle = do
+    chunk <- sourceRead source
     if BS.null chunk
         then pure ()
         else do
             BS.hPut outputHandle chunk
-            copyHandle inputHandle outputHandle
+            copySource source outputHandle
+
+parsePacketLength :: ByteString -> Maybe Int
+parsePacketLength bytes
+    | BS.length bytes < 4 = Nothing
+    | otherwise =
+        case readHex (BS8.unpack (BS.take 4 bytes)) of
+            [(0, "")] -> Just 0
+            [(packetLength, "")]
+                | packetLength >= 4 && packetLength <= 65520 -> Just packetLength
+            _ -> Nothing
 
 -- | The git:// protocol is a TCP socket with pkt-line framing.
 withGitTransport :: Config -> RemoteUrl -> (Transport -> IO a) -> IO a
@@ -430,10 +531,11 @@ withGitTransport _config remote action =
             Transport
                 { transportDiscovery = gitDiscovery remote
                 , transportUploadPackToFile =
-                    \caps wants destination ->
-                        gitUploadPack remote caps wants destination
+                    \caps wants haves destination ->
+                        gitUploadPack remote caps wants haves destination
                 , transportReceivePack =
-                    \_ _ -> ioError (userError "receive-pack over git:// is not implemented yet")
+                    \commands maybePack ->
+                        gitReceivePack remote commands maybePack
                 }
      in action transport
 
@@ -445,9 +547,7 @@ gitHostPort remote =
 
 gitDiscovery :: RemoteUrl -> Service -> IO DiscoveryAdvertisement
 gitDiscovery remote service = do
-    when (service == ReceivePackService) $
-        ioError (userError "receive-pack over git:// is not implemented yet")
-    handle <- gitConnect remote UploadPackService
+    handle <- gitConnect remote service
     advertisement <- readRefAdvertisementFromHandle handle
     hClose handle
     pure advertisement
@@ -456,19 +556,36 @@ gitUploadPack
     :: RemoteUrl
     -> [ByteString]
     -> [ObjectId]
+    -> [ObjectId]
     -> FilePath
     -> IO ()
-gitUploadPack remote advertisedCapabilities wantedIds destination = do
+gitUploadPack remote advertisedCapabilities wantedIds haves destination = do
     handle <- gitConnect remote UploadPackService
     _ <- readRefAdvertisementFromHandle handle
-    BS.hPut handle (encodeWantRequest advertisedCapabilities wantedIds)
+    BS.hPut handle (encodeWantRequest advertisedCapabilities wantedIds haves)
     hFlush handle
     writeUploadResponseFromHandle handle destination
     hClose handle
 
+gitReceivePack :: RemoteUrl -> ByteString -> Maybe FilePath -> IO ByteString
+gitReceivePack remote commands maybePack = do
+    (handle, _socketHandle) <- gitConnectWithSocket remote ReceivePackService
+    _ <- readRefAdvertisementFromHandle handle
+    BS.hPut handle commands
+    case maybePack of
+        Just packPath -> copyFileToHandle packPath handle
+        Nothing -> pure ()
+    hFlush handle
+    response <- readAllHandle handle
+    hClose handle
+    pure response
+
 -- | Connect to a git daemon. Closing the returned handle closes the connection.
 gitConnect :: RemoteUrl -> Service -> IO Handle
-gitConnect remote _service = do
+gitConnect remote service = fst <$> gitConnectWithSocket remote service
+
+gitConnectWithSocket :: RemoteUrl -> Service -> IO (Handle, Socket.Socket)
+gitConnectWithSocket remote service = do
     let (host, port) = gitHostPort remote
     addresses <-
         Socket.getAddrInfo
@@ -489,9 +606,13 @@ gitConnect remote _service = do
     let request =
             "/"
                 ++ remotePathText remote
-    BS.hPut handle (encodePacketLine (packetLine (BS8.pack ("git-upload-pack " ++ request ++ "\0host=" ++ host ++ "\0\0"))))
+        command =
+            case service of
+                UploadPackService -> "git-upload-pack"
+                ReceivePackService -> "git-receive-pack"
+    BS.hPut handle (encodePacketLine (packetLine (BS8.pack (command ++ " " ++ request ++ "\0host=" ++ host ++ "\0\0"))))
     hFlush handle
-    pure handle
+    pure (handle, socketHandle)
 
 remotePathText :: RemoteUrl -> String
 remotePathText remote =
@@ -574,11 +695,12 @@ httpUploadPack
     -> Maybe (ByteString, ByteString)
     -> [ByteString]
     -> [ObjectId]
+    -> [ObjectId]
     -> FilePath
     -> IO ()
-httpUploadPack manager config endpoint urlAuth advertisedCapabilities wantedIds destination = do
+httpUploadPack manager config endpoint urlAuth advertisedCapabilities wantedIds haves destination = do
     let path = uploadPackPath endpoint
-        requestBody = BL.fromStrict (encodeWantRequest advertisedCapabilities wantedIds)
+        requestBody = BL.fromStrict (encodeWantRequest advertisedCapabilities wantedIds haves)
     baseRequest <- parseRequest path
     let request =
             setRequestMethod (BS8.pack "POST")
@@ -690,48 +812,10 @@ readBodyReader reader = go []
 
 writeUploadPackBody :: BodyReader -> FilePath -> IO ()
 writeUploadPackBody reader destination =
-    withBinaryFile destination WriteMode $ \handle -> do
-        prefix <- readUploadPackPrefix reader
-        if BS8.isPrefixOf (BS8.pack "PACK") prefix
-            then do
-                BS.hPut handle prefix
-                copyBody reader handle
-            else
-                if BS8.isPrefixOf (BS8.pack "0008NAK\n") prefix
-                    then do
-                        BS.hPut handle (BS.drop 8 prefix)
-                        copyBody reader handle
-                    else
-                        case pktLineError prefix of
-                            Just message -> ioError (userError ("remote error: " ++ message))
-                            Nothing ->
-                                ioError
-                                    ( userError
-                                        ( "unexpected upload-pack response: "
-                                            ++ BS8.unpack (BS.take 60 prefix)
-                                        )
-                                    )
+    writeUploadResponse (ByteSource (brRead reader)) destination
 
-readUploadPackPrefix :: BodyReader -> IO ByteString
-readUploadPackPrefix reader = go BS.empty
-  where
-    go accumulated
-        | BS.length accumulated >= 8 = pure accumulated
-        | otherwise = do
-            chunk <- brRead reader
-            if BS.null chunk then pure accumulated else go (accumulated <> chunk)
-
-copyBody :: BodyReader -> Handle -> IO ()
-copyBody reader handle = do
-    chunk <- brRead reader
-    if BS.null chunk
-        then pure ()
-        else do
-            BS.hPut handle chunk
-            copyBody reader handle
-
-encodeWantRequest :: [ByteString] -> [ObjectId] -> ByteString
-encodeWantRequest advertisedCapabilities wantedIds =
+encodeWantRequest :: [ByteString] -> [ObjectId] -> [ObjectId] -> ByteString
+encodeWantRequest advertisedCapabilities wantedIds haves =
     case wantedIds of
         [] -> BS.empty
         firstId : otherIds ->
@@ -739,10 +823,14 @@ encodeWantRequest advertisedCapabilities wantedIds =
                 ( wantLine firstId requestedCapabilities
                     : map (\objectId -> wantLine objectId []) otherIds
                         ++ [ encodePacketLine flushPacket
-                           , encodePacketLine (packetLine (BS8.pack "done\n"))
+                           ]
+                        ++ map haveLine haves
+                        ++ [ encodePacketLine (packetLine (BS8.pack "done\n"))
                            ]
                 )
   where
+    haveLine objectId =
+        encodePacketLine (packetLine (BS8.pack ("have " ++ objectIdToHex objectId ++ "\n")))
     wantLine objectId capabilities =
         encodePacketLine
             ( packetLine

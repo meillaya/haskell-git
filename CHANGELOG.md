@@ -1,5 +1,25 @@
 # Revision history
 
+## 0.3.0.0 - 2026-11-09
+
+- Merge now performs a line-level diff3 and detects exact-content renames.
+- `merge --no-ff` / `--ff-only`, `pull --ff-only`, and `rebase --onto` are
+  implemented.
+- Fetch sends `have` lines and auto-follows reachable tags; `--tags` and
+  `--no-tags` control the behaviour.
+- `status` evaluates root `.gitignore` and `.git/info/exclude`.
+- `push --set-upstream`, `push --force-with-lease`, and git:// receive-pack are
+  implemented, and pushes update remote-tracking refs.
+- Refs are written under lock files and `HEAD`/branch reflogs are recorded.
+- `submodule sync` is implemented.
+- SHA-256 fetch and push work end to end, including the `object-format`
+  capability on receive-pack.
+- The test suite adds diff3, rename, merge-flag, rebase-onto, tag auto-follow,
+  SSH/git:// push, force-with-lease, `.gitignore`, reflog, and pack
+  round-trip coverage.
+- GitHub Actions runs the suite on GHC 9.6 and 9.10, `cabal check`, `cabal
+  sdist`, and a bounded-memory benchmark.
+
 ## 0.2.0.0 - 2026-11-07
 
 - SHA-256 repositories are supported alongside SHA-1. `init --object-format`

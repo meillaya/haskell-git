@@ -8,6 +8,8 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import Data.List (sort)
 import Git.Clone (CloneResult (..), cloneRepository)
+import Git.Fetch (defaultFetchOptions, fetchRepository)
+import Git.Push (defaultPushOptions, pushRepository)
 import Git.Hash
     ( HashAlgorithm (..)
     , ObjectId
@@ -75,6 +77,7 @@ run = do
     readsSha256PackedRepository
     writesSha256Repository
     clonesSha256Repository
+    fetchesAndPushesSha256
     clonesEmptySha256Repository
 
 hashVectors :: IO ()
@@ -320,6 +323,42 @@ clonesSha256Repository =
                 (sort (filter (not . null) (lines gitListing)))
                 (sort ourListing)
                 "Clone should produce the same tree as git ls-tree"
+
+fetchesAndPushesSha256 :: IO ()
+fetchesAndPushesSha256 =
+    withTempDirectory "haskell-git-sha256-transport" $ \temporaryDir -> do
+        let sourceDirectory = temporaryDir </> "source"
+            serveDirectory = temporaryDir </> "serve"
+            bareRepository = serveDirectory </> "repo.git"
+            destination = temporaryDir </> "clone"
+        _ <- createSha256Repository sourceDirectory
+        _ <- runGit ["-C", sourceDirectory, "config", "user.email", "ada@example.com"]
+        _ <- runGit ["-C", sourceDirectory, "config", "user.name", "Ada"]
+        createDirectoryIfMissing True serveDirectory
+        _ <- runGit ["clone", "-q", "--bare", sourceDirectory, bareRepository]
+        _ <- runGit ["-C", bareRepository, "config", "http.receivepack", "true"]
+        withHttpBackendServer serveDirectory "repo.git" $ \remoteUrl -> do
+            _ <- cloneRepository remoteUrl destination
+            _ <- runGit ["-C", destination, "config", "user.email", "ada@example.com"]
+            _ <- runGit ["-C", destination, "config", "user.name", "Ada"]
+            writeFile (destination </> "pushed.txt") "pushed sha256\n"
+            _ <- runGit ["-C", destination, "add", "-A"]
+            _ <- runGit ["-C", destination, "commit", "-qm", "push sha256"]
+            pushedHead <- trim <$> runGit ["-C", destination, "rev-parse", "HEAD"]
+            repository <- requireRepositoryAt destination
+            _ <- pushRepository repository "origin" ["refs/heads/main:refs/heads/main"] defaultPushOptions
+            remoteHead <- trim <$> runGit ["-C", bareRepository, "rev-parse", "refs/heads/main"]
+            assertEqual pushedHead remoteHead "SHA-256 push should update the remote branch"
+            writeFile (sourceDirectory </> "fetched.txt") "fetched sha256\n"
+            _ <- runGit ["-C", sourceDirectory, "add", "-A"]
+            _ <- runGit ["-C", sourceDirectory, "commit", "-qm", "fetch sha256"]
+            _ <- runGit ["-C", sourceDirectory, "push", "-q", "-f", bareRepository, "main"]
+            _ <- fetchRepository repository "origin" [] defaultFetchOptions
+            fetchedHead <- trim <$> runGit ["-C", destination, "rev-parse", "refs/remotes/origin/main"]
+            sourceHead <- trim <$> runGit ["-C", sourceDirectory, "rev-parse", "HEAD"]
+            assertEqual sourceHead fetchedHead "SHA-256 fetch should update the remote-tracking ref"
+            fsckText <- runGit ["-C", destination, "fsck", "--strict"]
+            assertEqual "" fsckText "SHA-256 fetch/push should leave a valid object store"
 
 clonesEmptySha256Repository :: IO ()
 clonesEmptySha256Repository =

@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: GHC ${{ matrix.ghc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ghc: ['9.6.7', '9.10.3']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: latest
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libz-dev libssl-dev pkg-config git python3 time
+      - name: Cache cabal packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cabal/packages
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ runner.os }}-ghc-${{ matrix.ghc }}-${{ hashFiles('haskell-git.cabal', 'cabal.project') }}
+          restore-keys: |
+            ${{ runner.os }}-ghc-${{ matrix.ghc }}-
+      - name: Build
+        run: cabal build all --enable-tests
+      - name: Test
+        run: cabal test all
+      - name: Memory benchmark
+        if: matrix.ghc == '9.10.3'
+        run: SIZE_MB=8 scripts/memory-benchmark.sh
+      - name: Package check
+        run: cabal check
+      - name: Source distribution
+        run: cabal sdist
