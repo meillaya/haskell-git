@@ -8,14 +8,14 @@ module Git.Transport
     , withTransport
     ) where
 
-import Control.Exception (bracket)
+import Control.Exception (bracket, onException)
 import Control.Monad (when)
 import qualified Data.CaseInsensitive as CI
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
-import Data.Char (isSpace)
+import Data.Char (isSpace, toLower)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe, isJust)
@@ -47,7 +47,7 @@ import Network.HTTP.Types.Header (hAccept, hContentType)
 import qualified Network.Socket as Socket
 import Numeric (readHex)
 import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
-import System.Environment (lookupEnv)
+import System.Environment (getEnvironment, lookupEnv)
 import System.Exit (ExitCode (ExitSuccess), ExitCode (ExitFailure))
 import System.FilePath ((</>))
 import System.IO
@@ -56,6 +56,7 @@ import System.IO
     , hClose
     , hFlush
     , hGetLine
+    , hIsClosed
     , hIsTerminalDevice
     , hPutStr
     , openTempFile
@@ -96,6 +97,7 @@ import Git.Protocol.SmartHTTP
     ( DiscoveryAdvertisement (..)
     , DiscoveryRef (..)
     , SmartHttpEndpoint (..)
+    , capabilityValue
     , discoveryCapabilities
     , discoveryObjectFormat
     , discoveryProtocolVersion
@@ -150,6 +152,88 @@ transportUploadPackToFileFor transport advertisement capabilities wantedIds have
     case (discoveryProtocolVersion advertisement, transportUploadPackV2ToFile transport) of
         (2, Just uploadV2) -> uploadV2 capabilities wantedIds haves destination
         _ -> transportUploadPackToFile transport capabilities wantedIds haves destination
+
+-- | The server's first protocol message on a stream transport (SSH or
+-- git://). Protocol v0 starts with a ref advertisement; protocol v2 starts
+-- with a version banner followed by capability lines.
+data VersionAdvertisement
+    = VersionAdvertisementV0 [ByteString]
+    | VersionAdvertisementV2 [ByteString]
+
+-- | Read the version-independent head of the server's first message. The
+-- payload lists are in wire order and exclude the terminating flush packet.
+readVersionAdvertisement :: Handle -> IO VersionAdvertisement
+readVersionAdvertisement handle = go []
+  where
+    go payloads = do
+        packet <- readPacketLineFromHandle handle
+        case packet of
+            Left err -> ioError (userError err)
+            Right FlushPacket ->
+                case reverse payloads of
+                    firstLine : remaining
+                        | trimTrailingNewline firstLine == BS8.pack "version 2" ->
+                            pure (VersionAdvertisementV2 remaining)
+                    _ -> pure (VersionAdvertisementV0 (reverse payloads))
+            Right (DataPacket payload) -> go (payload : payloads)
+
+readPacketLinesUntilFlush :: Handle -> IO [ByteString]
+readPacketLinesUntilFlush handle = go []
+  where
+    go payloads = do
+        packet <- readPacketLineFromHandle handle
+        case packet of
+            Left err -> ioError (userError err)
+            Right FlushPacket -> pure (reverse payloads)
+            Right (DataPacket payload) -> go (payload : payloads)
+
+-- | Read the object format out of the v2 capability lines. Advertisement
+-- capability values are newline-terminated in v2, so the trailing newline has
+-- to be trimmed before the name is compared.
+v2ObjectFormat :: [ByteString] -> HashAlgorithm
+v2ObjectFormat capabilities =
+    case capabilityValue (BS8.pack "object-format") capabilities of
+        Just value -> fromMaybe Sha1 (hashAlgorithmFromName (trimTrailingNewline value))
+        Nothing -> Sha1
+
+-- | Run the v2 @ls-refs@ command on an already-negotiated stream transport.
+discoverRefsV2 :: Handle -> Handle -> [ByteString] -> IO DiscoveryAdvertisement
+discoverRefsV2 inputHandle outputHandle capabilities = do
+    let objectFormat = v2ObjectFormat capabilities
+    BS.hPut inputHandle (encodeV2LsRefsRequest capabilities)
+    hFlush inputHandle
+    payloads <- readPacketLinesUntilFlush outputHandle
+    case parseV2LsRefsPayloads objectFormat capabilities payloads of
+        Left err -> ioError (userError err)
+        Right advertisement -> pure advertisement
+
+writeV2FetchResponseFromHandle :: Handle -> FilePath -> IO ()
+writeV2FetchResponseFromHandle handle destination =
+    writeV2FetchResponse (handleSource handle) destination
+
+hCloseIfOpen :: Handle -> IO ()
+hCloseIfOpen handle = do
+    closed <- hIsClosed handle
+    when (not closed) (hClose handle)
+
+configuredProtocolVersion :: Config -> Maybe Int
+configuredProtocolVersion config =
+    case configGet config "protocol.version" of
+        Just value ->
+            case reads (trim value) of
+                [(version, "")] -> Just (version :: Int)
+                _ -> Nothing
+        Nothing -> Nothing
+
+-- | Protocol v2 is the default, matching git. @protocol.version=0@ or @1@
+-- forces the v0 request path; any other value keeps the v2 default.
+protocolVersionAllowsV2 :: Maybe Int -> Bool
+protocolVersionAllowsV2 configured =
+    case configured of
+        Just 0 -> False
+        Just 1 -> False
+        _ -> True
+
 
 parseRemoteUrl :: String -> Either String RemoteUrl
 parseRemoteUrl url
@@ -249,17 +333,32 @@ withTransport config url action =
 
 -- | OpenSSH is the transport. We start it per operation and reuse the same
 -- command-line conventions git uses: @ssh [opts] host 'git-upload-pack path'@.
+-- Protocol v2 is negotiated by exporting @GIT_PROTOCOL=version=2@ to the ssh
+-- child and asking OpenSSH to forward it with @-o SendEnv@; servers that do
+-- not forward it answer with a v0 advertisement and we fall back.
 withSshTransport :: Config -> RemoteUrl -> (Transport -> IO a) -> IO a
 withSshTransport config remote action = do
     (command, baseArguments) <- sshCommand config
-    let transport =
+    variant <- sshVariant config
+    let attemptV2 =
+            protocolVersionAllowsV2 (configuredProtocolVersion config)
+                && variantSupportsProtocolEnvironment variant
+        transport =
             Transport
                 { transportDiscovery =
-                    \service -> sshDiscovery command baseArguments remote service
+                    \service ->
+                        sshDiscovery command baseArguments remote (attemptV2 && service == UploadPackService) service
                 , transportUploadPackToFile =
                     \caps wants haves destination ->
                         sshUploadPack command baseArguments remote caps wants haves destination
-                , transportUploadPackV2ToFile = Nothing
+                , transportUploadPackV2ToFile =
+                    if attemptV2
+                        then
+                            Just
+                                ( \caps wants haves destination ->
+                                    sshUploadPackV2 command baseArguments remote caps wants haves destination
+                                )
+                        else Nothing
                 , transportReceivePack =
                     \commands maybePack ->
                         sshReceivePack command baseArguments remote commands maybePack
@@ -282,10 +381,42 @@ sshCommand config = do
     orElse (Just value) _ = Just value
     orElse Nothing fallback = fallback
 
-sshArguments :: [String] -> RemoteUrl -> String -> [String]
-sshArguments baseArguments remote remoteCommand =
+-- | SSH implementations differ in how they forward environment variables.
+-- OpenSSH forwards variables named by @SendEnv@, and that is how git passes
+-- protocol v2 to the server. Variants that cannot forward the environment
+-- keep the v0 path.
+data SshVariant
+    = SshVariantAuto
+    | SshVariantOpenSsh
+    | SshVariantSimple
+    | SshVariantPlink
+    | SshVariantPutty
+    | SshVariantTortoisePlink
+
+sshVariant :: Config -> IO SshVariant
+sshVariant config = do
+    environmentVariant <- lookupEnv "GIT_SSH_VARIANT"
+    let configured = firstJust [environmentVariant, configGet config "ssh.variant"]
+    pure $ case fmap (map toLower . trim) configured of
+        Just "ssh" -> SshVariantOpenSsh
+        Just "simple" -> SshVariantSimple
+        Just "plink" -> SshVariantPlink
+        Just "putty" -> SshVariantPutty
+        Just "tortoiseplink" -> SshVariantTortoisePlink
+        _ -> SshVariantAuto
+
+variantSupportsProtocolEnvironment :: SshVariant -> Bool
+variantSupportsProtocolEnvironment variant =
+    case variant of
+        SshVariantAuto -> True
+        SshVariantOpenSsh -> True
+        _ -> False
+
+sshArguments :: [String] -> RemoteUrl -> Bool -> String -> [String]
+sshArguments baseArguments remote forwardProtocol remoteCommand =
     baseArguments
         ++ portArguments
+        ++ sendEnvArguments
         ++ [userHost]
         ++ [remoteCommand]
   where
@@ -293,6 +424,10 @@ sshArguments baseArguments remote remoteCommand =
         case remote of
             SshUrl {remotePort = Just port} -> ["-p", show port]
             _ -> []
+    sendEnvArguments =
+        if forwardProtocol
+            then ["-o", "SendEnv=GIT_PROTOCOL"]
+            else []
     userHost =
         case remote of
             SshUrl {remoteUser = Just user, remoteHost = host} -> user ++ "@" ++ host
@@ -317,34 +452,67 @@ sshRemoteCommand remote service =
     escape '\'' = "'\\''"
     escape character = [character]
 
-sshStartProcess :: FilePath -> [String] -> RemoteUrl -> Service -> IO (Handle, Handle, ProcessHandle)
-sshStartProcess command arguments remote service = do
-    let process =
-            (proc command (sshArguments arguments remote (sshRemoteCommand remote service)))
+sshStartProcess
+    :: FilePath
+    -> [String]
+    -> RemoteUrl
+    -> Service
+    -> Bool
+    -> IO (Handle, Handle, ProcessHandle)
+sshStartProcess command arguments remote service requestProtocolV2 = do
+    environment <- getEnvironment
+    let forwardProtocol = requestProtocolV2 && service == UploadPackService
+        process =
+            ( proc
+                command
+                (sshArguments arguments remote forwardProtocol (sshRemoteCommand remote service))
+            )
                 { std_in = CreatePipe
                 , std_out = CreatePipe
                 , std_err = Inherit
+                , env =
+                    if forwardProtocol
+                        then Just (protocolEnvironment environment)
+                        else Nothing
                 }
     (maybeInput, maybeOutput, _, processHandle) <- createProcess process
     case (maybeInput, maybeOutput) of
         (Just inputHandle, Just outputHandle) -> pure (inputHandle, outputHandle, processHandle)
         _ -> ioError (userError "failed to connect to the SSH process")
+  where
+    protocolEnvironment environment =
+        ("GIT_PROTOCOL", "version=2")
+            : filter ((/= "GIT_PROTOCOL") . fst) environment
+
+stopSshProcess :: (Handle, Handle, ProcessHandle) -> IO ()
+stopSshProcess (inputHandle, outputHandle, processHandle) = do
+    hCloseIfOpen inputHandle
+    hCloseIfOpen outputHandle
+    terminateProcess processHandle
+    _ <- waitForProcess processHandle
+    pure ()
 
 sshDiscovery
     :: FilePath
     -> [String]
     -> RemoteUrl
+    -> Bool
     -> Service
     -> IO DiscoveryAdvertisement
-sshDiscovery command arguments remote service = do
-    (inputHandle, outputHandle, processHandle) <-
-        sshStartProcess command arguments remote service
-    advertisement <- readRefAdvertisementFromHandle outputHandle
-    hClose inputHandle
-    hClose outputHandle
-    terminateProcess processHandle
-    _ <- waitForProcess processHandle
-    pure advertisement
+sshDiscovery command arguments remote requestProtocolV2 service =
+    bracket
+        (sshStartProcess command arguments remote service requestProtocolV2)
+        stopSshProcess
+        ( \(inputHandle, outputHandle, _) -> do
+            versionAdvertisement <- readVersionAdvertisement outputHandle
+            case versionAdvertisement of
+                VersionAdvertisementV2 capabilities ->
+                    discoverRefsV2 inputHandle outputHandle capabilities
+                VersionAdvertisementV0 payloads ->
+                    case parseRefAdvertisement payloads of
+                        Left err -> ioError (userError err)
+                        Right advertisement -> pure advertisement
+        )
 
 sshUploadPack
     :: FilePath
@@ -357,13 +525,61 @@ sshUploadPack
     -> IO ()
 sshUploadPack command arguments remote advertisedCapabilities wantedIds haves destination = do
     (inputHandle, outputHandle, processHandle) <-
-        sshStartProcess command arguments remote UploadPackService
+        sshStartProcess command arguments remote UploadPackService False
     _ <- readRefAdvertisementFromHandle outputHandle
     BS.hPut inputHandle (encodeWantRequest advertisedCapabilities wantedIds haves)
     hFlush inputHandle
     hClose inputHandle
     writeUploadResponseFromHandle outputHandle destination
     hClose outputHandle
+    exitCode <- waitForProcess processHandle
+    case exitCode of
+        ExitSuccess -> pure ()
+        ExitFailure code -> ioError (userError ("ssh upload-pack failed with exit code " ++ show code))
+
+-- | The v2 fetch path. A server that answered v2 on the discovery connection
+-- but not on this one is impossible in practice; if it happens, the v0 want
+-- request is sent instead so the fetch still completes.
+sshUploadPackV2
+    :: FilePath
+    -> [String]
+    -> RemoteUrl
+    -> [ByteString]
+    -> [ObjectId]
+    -> [ObjectId]
+    -> FilePath
+    -> IO ()
+sshUploadPackV2 command arguments remote _advertisedCapabilities wantedIds haves destination = do
+    (inputHandle, outputHandle, processHandle) <-
+        sshStartProcess command arguments remote UploadPackService True
+    let cleanup = do
+            hCloseIfOpen inputHandle
+            hCloseIfOpen outputHandle
+            terminateProcess processHandle
+            _ <- waitForProcess processHandle
+            pure ()
+    ( do
+        versionAdvertisement <- readVersionAdvertisement outputHandle
+        case versionAdvertisement of
+            VersionAdvertisementV2 capabilities -> do
+                BS.hPut inputHandle (encodeV2FetchRequest capabilities wantedIds haves)
+                hFlush inputHandle
+                hClose inputHandle
+                writeV2FetchResponseFromHandle outputHandle destination
+            VersionAdvertisementV0 payloads -> do
+                advertisement <-
+                    case parseRefAdvertisement payloads of
+                        Left err -> ioError (userError err)
+                        Right parsed -> pure parsed
+                BS.hPut
+                    inputHandle
+                    (encodeWantRequest (discoveryCapabilities advertisement) wantedIds haves)
+                hFlush inputHandle
+                hClose inputHandle
+                writeUploadResponseFromHandle outputHandle destination
+        )
+        `onException` cleanup
+    hCloseIfOpen outputHandle
     exitCode <- waitForProcess processHandle
     case exitCode of
         ExitSuccess -> pure ()
@@ -378,7 +594,7 @@ sshReceivePack
     -> IO ByteString
 sshReceivePack command arguments remote commands maybePack = do
     (inputHandle, outputHandle, processHandle) <-
-        sshStartProcess command arguments remote ReceivePackService
+        sshStartProcess command arguments remote ReceivePackService False
     _ <- readRefAdvertisementFromHandle outputHandle
     BS.hPut inputHandle commands
     case maybePack of
@@ -559,21 +775,29 @@ parsePacketLength bytes
                 | packetLength >= 4 && packetLength <= 65520 -> Just packetLength
             _ -> Nothing
 
--- | The git:// protocol is a TCP socket with pkt-line framing.
+-- | The git:// protocol is a TCP socket with pkt-line framing. Protocol v2 is
+-- requested with an extra @version=2@ parameter on the initial request; an
+-- older daemon ignores it and sends a v0 ref advertisement, in which case the
+-- v0 request path is used.
 withGitTransport :: Config -> RemoteUrl -> (Transport -> IO a) -> IO a
-withGitTransport _config remote action =
-    let transport =
+withGitTransport config remote action = do
+    let attemptV2 = protocolVersionAllowsV2 (configuredProtocolVersion config)
+        transport =
             Transport
-                { transportDiscovery = gitDiscovery remote
+                { transportDiscovery =
+                    \service -> gitDiscovery remote (attemptV2 && service == UploadPackService) service
                 , transportUploadPackToFile =
                     \caps wants haves destination ->
                         gitUploadPack remote caps wants haves destination
-                , transportUploadPackV2ToFile = Nothing
+                , transportUploadPackV2ToFile =
+                    if attemptV2
+                        then Just (gitUploadPackV2 remote)
+                        else Nothing
                 , transportReceivePack =
                     \commands maybePack ->
                         gitReceivePack remote commands maybePack
                 }
-     in action transport
+    action transport
 
 gitHostPort :: RemoteUrl -> (String, Int)
 gitHostPort remote =
@@ -581,12 +805,21 @@ gitHostPort remote =
         GitUrl {remoteHost = host, remotePort = port} -> (host, fromMaybe 9418 port)
         _ -> ("127.0.0.1", 9418)
 
-gitDiscovery :: RemoteUrl -> Service -> IO DiscoveryAdvertisement
-gitDiscovery remote service = do
-    handle <- gitConnect remote service
-    advertisement <- readRefAdvertisementFromHandle handle
-    hClose handle
-    pure advertisement
+gitDiscovery :: RemoteUrl -> Bool -> Service -> IO DiscoveryAdvertisement
+gitDiscovery remote requestProtocolV2 service =
+    bracket
+        (gitConnect remote requestProtocolV2 service)
+        hClose
+        ( \handle -> do
+            versionAdvertisement <- readVersionAdvertisement handle
+            case versionAdvertisement of
+                VersionAdvertisementV2 capabilities ->
+                    discoverRefsV2 handle handle capabilities
+                VersionAdvertisementV0 payloads ->
+                    case parseRefAdvertisement payloads of
+                        Left err -> ioError (userError err)
+                        Right advertisement -> pure advertisement
+        )
 
 gitUploadPack
     :: RemoteUrl
@@ -596,16 +829,49 @@ gitUploadPack
     -> FilePath
     -> IO ()
 gitUploadPack remote advertisedCapabilities wantedIds haves destination = do
-    handle <- gitConnect remote UploadPackService
+    handle <- gitConnect remote False UploadPackService
     _ <- readRefAdvertisementFromHandle handle
     BS.hPut handle (encodeWantRequest advertisedCapabilities wantedIds haves)
     hFlush handle
     writeUploadResponseFromHandle handle destination
     hClose handle
 
+-- | The v2 fetch path over git://. A daemon that answered v2 during discovery
+-- but not on this connection is not expected; if it happens, the v0 want
+-- request is sent instead so the fetch still completes.
+gitUploadPackV2
+    :: RemoteUrl
+    -> [ByteString]
+    -> [ObjectId]
+    -> [ObjectId]
+    -> FilePath
+    -> IO ()
+gitUploadPackV2 remote _advertisedCapabilities wantedIds haves destination =
+    bracket
+        (gitConnect remote True UploadPackService)
+        hClose
+        ( \handle -> do
+            versionAdvertisement <- readVersionAdvertisement handle
+            case versionAdvertisement of
+                VersionAdvertisementV2 capabilities -> do
+                    BS.hPut handle (encodeV2FetchRequest capabilities wantedIds haves)
+                    hFlush handle
+                    writeV2FetchResponseFromHandle handle destination
+                VersionAdvertisementV0 payloads -> do
+                    advertisement <-
+                        case parseRefAdvertisement payloads of
+                            Left err -> ioError (userError err)
+                            Right parsed -> pure parsed
+                    BS.hPut
+                        handle
+                        (encodeWantRequest (discoveryCapabilities advertisement) wantedIds haves)
+                    hFlush handle
+                    writeUploadResponseFromHandle handle destination
+        )
+
 gitReceivePack :: RemoteUrl -> ByteString -> Maybe FilePath -> IO ByteString
 gitReceivePack remote commands maybePack = do
-    (handle, _socketHandle) <- gitConnectWithSocket remote ReceivePackService
+    (handle, _socketHandle) <- gitConnectWithSocket remote False ReceivePackService
     _ <- readRefAdvertisementFromHandle handle
     BS.hPut handle commands
     case maybePack of
@@ -617,11 +883,12 @@ gitReceivePack remote commands maybePack = do
     pure response
 
 -- | Connect to a git daemon. Closing the returned handle closes the connection.
-gitConnect :: RemoteUrl -> Service -> IO Handle
-gitConnect remote service = fst <$> gitConnectWithSocket remote service
+gitConnect :: RemoteUrl -> Bool -> Service -> IO Handle
+gitConnect remote requestProtocolV2 service =
+    fst <$> gitConnectWithSocket remote requestProtocolV2 service
 
-gitConnectWithSocket :: RemoteUrl -> Service -> IO (Handle, Socket.Socket)
-gitConnectWithSocket remote service = do
+gitConnectWithSocket :: RemoteUrl -> Bool -> Service -> IO (Handle, Socket.Socket)
+gitConnectWithSocket remote requestProtocolV2 service = do
     let (host, port) = gitHostPort remote
     addresses <-
         Socket.getAddrInfo
@@ -639,14 +906,20 @@ gitConnectWithSocket remote service = do
             (Socket.addrProtocol address)
     Socket.connect socketHandle (Socket.addrAddress address)
     handle <- Socket.socketToHandle socketHandle ReadWriteMode
-    let request =
-            "/"
-                ++ remotePathText remote
+    let request = "/" ++ remotePathText remote
         command =
             case service of
                 UploadPackService -> "git-upload-pack"
                 ReceivePackService -> "git-receive-pack"
-    BS.hPut handle (encodePacketLine (packetLine (BS8.pack (command ++ " " ++ request ++ "\0host=" ++ host ++ "\0\0"))))
+        requestHead =
+            command ++ " " ++ request ++ "\0host=" ++ host ++ "\0"
+        protocolSuffix =
+            if requestProtocolV2 && service == UploadPackService
+                then "\0version=2\0"
+                else "\0"
+    BS.hPut
+        handle
+        (encodePacketLine (packetLine (BS8.pack (requestHead ++ protocolSuffix))))
     hFlush handle
     pure (handle, socketHandle)
 
@@ -757,10 +1030,7 @@ httpV2Discovery
     -> IO DiscoveryAdvertisement
 httpV2Discovery config endpoint urlAuth capabilities = do
     manager <- newManager tlsManagerSettings
-    let objectFormat =
-            case capabilityValue (BS8.pack "object-format") capabilities of
-                Just value -> fromMaybe Sha1 (hashAlgorithmFromName value)
-                Nothing -> Sha1
+    let objectFormat = v2ObjectFormat capabilities
         requestBody = encodeV2LsRefsRequest capabilities
     baseRequest <- parseRequest (uploadPackPath endpoint)
     let request =
@@ -775,15 +1045,6 @@ httpV2Discovery config endpoint urlAuth capabilities = do
     case parseV2LsRefsResponse objectFormat capabilities (getResponseBody response) of
         Left err -> ioError (userError err)
         Right advertisement -> pure advertisement
-  where
-    capabilityValue name advertised =
-        firstJust
-            [ Just (BS.drop (BS.length prefix) capability)
-            | capability <- advertised
-            , prefix `BS8.isPrefixOf` capability
-            ]
-      where
-        prefix = name <> BS8.singleton '='
 
 encodeV2LsRefsRequest :: [ByteString] -> ByteString
 encodeV2LsRefsRequest capabilities =
@@ -813,7 +1074,17 @@ parseV2LsRefsResponse
     -> Either String DiscoveryAdvertisement
 parseV2LsRefsResponse objectFormat capabilities raw = do
     packets <- decodePacketLinesV2 raw
-    let payloads = [payload | DataPacketV2 payload <- packets]
+    parseV2LsRefsPayloads objectFormat capabilities [payload | DataPacketV2 payload <- packets]
+
+-- | Parse the payload lines of an @ls-refs@ response. Stream transports read
+-- the lines straight off the connection instead of decoding a whole response
+-- body, so the parser is shared between the HTTP and the stream paths.
+parseV2LsRefsPayloads
+    :: HashAlgorithm
+    -> [ByteString]
+    -> [ByteString]
+    -> Either String DiscoveryAdvertisement
+parseV2LsRefsPayloads objectFormat capabilities payloads =
     foldl addLine (Right (capabilities, [], Nothing :: Maybe ByteString, [])) payloads
         >>= \(caps, refs, symref, peeled) ->
             Right

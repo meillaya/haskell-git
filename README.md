@@ -40,6 +40,21 @@ Install the executable somewhere on your path:
 $ cabal install exe:haskell-git --overwrite-policy=always --installdir="$HOME/.local/bin"
 ```
 
+### Nix flake
+
+The repository also ships a flake, so Nix users can run or install the tool
+without the devenv shell:
+
+```console
+$ nix run . -- --help
+$ nix build .#default
+$ nix profile install .
+```
+
+The flake provides the package, a dev shell, an overlay, and NixOS and Home
+Manager modules (`programs.haskell-git.enable`). See [docs/nix.md](docs/nix.md)
+for the NixOS configuration snippet and the other outputs.
+
 Without Nix you need GHC 9.6 or newer, cabal-install, and the zlib development
 headers. `cabal build` then behaves the same way.
 
@@ -258,6 +273,14 @@ checked out, and pack index tables are loaded in full.
 - Smart HTTP, SSH, and git:// are supported. SSH is implemented by invoking
   OpenSSH, as git itself does; there is no in-process SSH stack. HTTP
   Digest/NTLM authentication is not supported.
+- Fetch sends `have` lines for a compact negotiation and auto-follows tags
+  reachable from fetched branches; `--tags` fetches every tag. Protocol v2
+  (`ls-refs` and `fetch`) is negotiated on HTTP(S), SSH, and git://, falling
+  back to v0 when the server does not advertise it. The SSH transport forwards
+  `GIT_PROTOCOL` through OpenSSH's `SendEnv` option, so v2 over SSH needs an
+  OpenSSH-compatible client and a server that accepts that environment
+  variable; other `GIT_SSH_VARIANT` values and `protocol.version=0` use v0.
+  Push stays on v0 because the protocol defines no v2 receive-pack.
 - SHA-1 and SHA-256 are supported. Object formats cannot be converted, and a
   dual-hash `compatObjectFormat` repository is refused.
 - Pack files are streamed, but a single object is held in memory while it is
@@ -278,8 +301,7 @@ checked out, and pack index tables are loaded in full.
   renames whose contents changed by at least 50% similarity. Conflicts are
   still resolved at file granularity.
 - Fetch sends `have` lines for a compact negotiation and auto-follows tags
-  reachable from fetched branches; `--tags` fetches every tag. HTTP(S) uses
-  protocol v2 (`ls-refs` and `fetch`); SSH and git:// still use v0.
+  reachable from fetched branches; `--tags` fetches every tag.
 - Push works over Smart HTTP, SSH, and git:// (the daemon must enable
   receive-pack).
 - Reflogs are written for `HEAD` and local branches with generic

@@ -22,6 +22,9 @@ extra-source-files:
     devenv.nix
     devenv.lock
     devenv.yaml
+    docs/nix.md
+    flake.nix
+    flake.lock
     docs/figures/*.excalidraw
     docs/figures/*.png
     docs/figures/gen_figures.py
@@ -145,6 +148,7 @@ test-suite haskell-git-test
         Git.PropertySpec
         Git.Protocol.PacketLineSpec
         Git.Protocol.SmartHTTPSpec
+        Git.ProtocolVersionSpec
         Git.PushSpec
         Git.RebaseSpec
         Git.RefsSpec

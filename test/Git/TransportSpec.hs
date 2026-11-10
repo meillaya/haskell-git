@@ -32,10 +32,13 @@ import TestSupport
 run :: IO ()
 run = do
     sshCloneAndFetch
+    sshProtocolV2CloneAndFetch
+    sshProtocolV0FallbackClone
     sshPush
     gitDaemonCloneAndFetch
     gitDaemonPush
     httpProtocolV2CloneAndFetch
+    httpProtocolV2Sha256Clone
 
 sshCloneAndFetch :: IO ()
 sshCloneAndFetch =
@@ -67,6 +70,77 @@ sshCloneAndFetch =
             _ <- runGit ["-C", sourceDirectory, "push", "-q", bareRepository, "main"]
             repository <- requireRepository destination
             _ <- fetchRepository repository "origin" [] defaultFetchOptions
+            _ <- runGit ["-C", destination, "fsck", "--strict"]
+            pure ()
+
+-- | The fake ssh server refuses to serve unless the client forwarded
+-- @GIT_PROTOCOL=version=2@, so a successful clone proves the SSH transport
+-- negotiated protocol v2.
+sshProtocolV2CloneAndFetch :: IO ()
+sshProtocolV2CloneAndFetch =
+    withTempDirectory "haskell-git-ssh-v2" $ \temporaryDir -> do
+        let sourceDirectory = temporaryDir </> "source"
+            bareRepository = temporaryDir </> "repo.git"
+            destination = temporaryDir </> "clone"
+            sshScript = temporaryDir </> "fake-ssh-v2.sh"
+        _ <- createSource sourceDirectory
+        _ <- runGit ["clone", "-q", "--bare", sourceDirectory, bareRepository]
+        writeFile
+            sshScript
+            ( unlines
+                [ "#!/bin/sh"
+                , "if [ \"$GIT_PROTOCOL\" != \"version=2\" ]; then"
+                , "  echo 'expected GIT_PROTOCOL=version=2' >&2"
+                , "  exit 97"
+                , "fi"
+                , "exec git-upload-pack " ++ show bareRepository ++ " 2>/dev/null"
+                ]
+            )
+        _ <- runBash ("chmod +x " ++ sshScript)
+        withEnvironment "GIT_SSH_COMMAND" sshScript $ do
+            result <- cloneRepository "ssh://example/repo.git" destination
+            assert (cloneHead result /= Nothing) "SSH v2 clone should fetch a HEAD"
+            statusText <- runGit ["-C", destination, "status", "--porcelain"]
+            assertEqual "" statusText "SSH v2 clone should be clean"
+            _ <- runGit ["-C", sourceDirectory, "config", "user.email", "ada@example.com"]
+            _ <- runGit ["-C", sourceDirectory, "config", "user.name", "Ada"]
+            writeFile (sourceDirectory </> "second.txt") "second\n"
+            _ <- runGit ["-C", sourceDirectory, "add", "-A"]
+            _ <- runGit ["-C", sourceDirectory, "commit", "-qm", "second"]
+            _ <- runGit ["-C", sourceDirectory, "push", "-q", bareRepository, "main"]
+            repository <- requireRepository destination
+            _ <- fetchRepository repository "origin" [] defaultFetchOptions
+            fetchedHead <- trim <$> runGit ["-C", destination, "rev-parse", "refs/remotes/origin/main"]
+            sourceHead <- trim <$> runGit ["-C", sourceDirectory, "rev-parse", "HEAD"]
+            assertEqual sourceHead fetchedHead "SSH v2 fetch should update the tracking ref"
+            _ <- runGit ["-C", destination, "fsck", "--strict"]
+            pure ()
+
+-- | A server that ignores the forwarded @GIT_PROTOCOL@ answers with a v0
+-- advertisement; the transport must fall back to v0 instead of failing.
+sshProtocolV0FallbackClone :: IO ()
+sshProtocolV0FallbackClone =
+    withTempDirectory "haskell-git-ssh-v0" $ \temporaryDir -> do
+        let sourceDirectory = temporaryDir </> "source"
+            bareRepository = temporaryDir </> "repo.git"
+            destination = temporaryDir </> "clone"
+            sshScript = temporaryDir </> "fake-ssh-v0.sh"
+        _ <- createSource sourceDirectory
+        _ <- runGit ["clone", "-q", "--bare", sourceDirectory, bareRepository]
+        writeFile
+            sshScript
+            ( unlines
+                [ "#!/bin/sh"
+                , "unset GIT_PROTOCOL"
+                , "exec git-upload-pack " ++ show bareRepository ++ " 2>/dev/null"
+                ]
+            )
+        _ <- runBash ("chmod +x " ++ sshScript)
+        withEnvironment "GIT_SSH_COMMAND" sshScript $ do
+            result <- cloneRepository "ssh://example/repo.git" destination
+            assert (cloneHead result /= Nothing) "SSH v0 fallback clone should fetch a HEAD"
+            statusText <- runGit ["-C", destination, "status", "--porcelain"]
+            assertEqual "" statusText "SSH v0 fallback clone should be clean"
             _ <- runGit ["-C", destination, "fsck", "--strict"]
             pure ()
 
@@ -132,6 +206,33 @@ httpProtocolV2CloneAndFetch =
             _ <- runGit ["-C", destination, "fsck", "--strict"]
             pure ()
 
+-- | SHA-256 repositories over protocol v2: the object format comes from the
+-- advertisement capability, which v2 terminates with a newline.
+httpProtocolV2Sha256Clone :: IO ()
+httpProtocolV2Sha256Clone =
+    withTempDirectory "haskell-git-http-v2-sha256" $ \temporaryDir -> do
+        let sourceDirectory = temporaryDir </> "source"
+            serveDirectory = temporaryDir </> "serve"
+            bareRepository = serveDirectory </> "repo.git"
+            destination = temporaryDir </> "clone"
+        _ <- runGit ["init", "-q", "-b", "main", "--object-format=sha256", sourceDirectory]
+        _ <- runGit ["-C", sourceDirectory, "config", "user.email", "ada@example.com"]
+        _ <- runGit ["-C", sourceDirectory, "config", "user.name", "Ada"]
+        writeFile (sourceDirectory </> "hello.txt") "hello sha256\n"
+        _ <- runGit ["-C", sourceDirectory, "add", "-A"]
+        _ <- runGit ["-C", sourceDirectory, "commit", "-qm", "first"]
+        createDirectoryIfMissing True serveDirectory
+        _ <- runGit ["clone", "-q", "--bare", sourceDirectory, bareRepository]
+        withHttpBackendServerV2 serveDirectory "repo.git" $ \remoteUrl -> do
+            result <- cloneRepository remoteUrl destination
+            assert (cloneHead result /= Nothing) "protocol v2 sha256 clone should fetch a HEAD"
+            statusText <- runGit ["-C", destination, "status", "--porcelain"]
+            assertEqual "" statusText "protocol v2 sha256 clone should be clean"
+            _ <- runGit ["-C", destination, "fsck", "--strict"]
+            format <- trim <$> runGit ["-C", destination, "rev-parse", "--show-object-format"]
+            assertEqual "sha256" format "protocol v2 clone should keep the sha256 object format"
+            pure ()
+
 gitDaemonCloneAndFetch :: IO ()
 gitDaemonCloneAndFetch =
     withTempDirectory "haskell-git-gitdaemon" $ \temporaryDir -> do
@@ -151,6 +252,18 @@ gitDaemonCloneAndFetch =
                 assert (cloneHead result /= Nothing) "git:// clone should fetch a HEAD"
                 statusText <- runGit ["-C", destination, "status", "--porcelain"]
                 assertEqual "" statusText "git:// clone should be clean"
+                _ <- runGit ["-C", destination, "fsck", "--strict"]
+                _ <- runGit ["-C", sourceDirectory, "config", "user.email", "ada@example.com"]
+                _ <- runGit ["-C", sourceDirectory, "config", "user.name", "Ada"]
+                writeFile (sourceDirectory </> "second.txt") "second\n"
+                _ <- runGit ["-C", sourceDirectory, "add", "-A"]
+                _ <- runGit ["-C", sourceDirectory, "commit", "-qm", "second"]
+                _ <- runGit ["-C", sourceDirectory, "push", "-q", bareRepository, "main"]
+                repository <- requireRepository destination
+                _ <- fetchRepository repository "origin" [] defaultFetchOptions
+                fetchedHead <- trim <$> runGit ["-C", destination, "rev-parse", "refs/remotes/origin/main"]
+                sourceHead <- trim <$> runGit ["-C", sourceDirectory, "rev-parse", "HEAD"]
+                assertEqual sourceHead fetchedHead "protocol v2 git:// fetch should update the tracking ref"
                 _ <- runGit ["-C", destination, "fsck", "--strict"]
                 pure ()
             )

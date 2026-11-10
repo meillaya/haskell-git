@@ -19,6 +19,7 @@ import qualified Git.PackSpec as PackSpec
 import qualified Git.PropertySpec as PropertySpec
 import qualified Git.Protocol.PacketLineSpec as PacketLineSpec
 import qualified Git.Protocol.SmartHTTPSpec as SmartHTTPSpec
+import qualified Git.ProtocolVersionSpec as ProtocolVersionSpec
 import qualified Git.PushSpec as PushSpec
 import qualified Git.RebaseSpec as RebaseSpec
 import qualified Git.RefsSpec as RefsSpec
@@ -55,6 +56,7 @@ main = do
     FetchSpec.run
     AuthSpec.run
     TransportSpec.run
+    ProtocolVersionSpec.run
     PushSpec.run
     WorktreeSpec.run
     MergeSpec.run

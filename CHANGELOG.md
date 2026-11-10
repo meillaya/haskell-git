@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A Nix flake packages the CLI and library and provides a dev shell, an
+  overlay, and NixOS and Home Manager modules (`programs.haskell-git.enable`).
 - Nested `.gitignore` files are evaluated by `status`.
 - `submodule add`, `submodule deinit`, and branch-aware
   `submodule update --remote` are implemented.
@@ -11,6 +13,11 @@
   is at least 50%.
 - HTTP(S) transport negotiates protocol v2 using `ls-refs` and `fetch`, with
   fallback to v0 when the server does not support it.
+- SSH and git:// transports negotiate protocol v2 as well: the SSH transport
+  forwards `GIT_PROTOCOL` through OpenSSH's `SendEnv` mechanism and the git://
+  transport sends the `version=2` extra parameter. Both fall back to v0 when
+  the server does not advertise version 2, and `protocol.version=0` forces the
+  v0 path.
 - Clone and fetch retain self-contained packs together with a v2 index and
   remove the loose object duplicates; thin packs continue to use loose
   objects.
