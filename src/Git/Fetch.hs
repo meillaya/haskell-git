@@ -14,6 +14,7 @@ import qualified Data.Set as Set
 import Git.Config (Config, configGet, configGetAll, loadRepositoryConfig)
 import Git.Hash (ObjectId, objectIdToHex)
 import Git.Pack.Import (importPackFile)
+import Git.Pack.Retain (retainPackFile)
 import Git.Protocol.SmartHTTP
     ( DiscoveryAdvertisement
     , DiscoveryRef
@@ -126,6 +127,7 @@ fetchRepository repository remoteArgument explicitRefSpecs options = do
                     haves
                     packPath
                 importPackFile objectFormat repository packPath
+                retainPackFile objectFormat repository packPath
         updated <- updateRefs repository matched
         autoTags <-
             if fetchNoTags options || fetchTags options

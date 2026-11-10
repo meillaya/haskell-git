@@ -59,6 +59,7 @@ library
         Git.Pack.Import
         Git.Pack.Index
         Git.Pack.Read
+        Git.Pack.Retain
         Git.Pack.Stream
         Git.Pack.Write
         Git.Protocol.PacketLine

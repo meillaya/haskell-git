@@ -248,8 +248,10 @@ checkout is clean and git fills the stat fields in on the next status.
 Pack files are read through file handles and streamed into the importer; a
 clone or fetch spools the response to a temporary pack file and never keeps
 the whole pack in memory. Resolved delta bases are cached in a bounded memo
-table. A single object must still fit in memory while it is read or checked
-out, and pack index tables are loaded in full.
+table. Self-contained packs are then retained under `.git/objects/pack` with
+a v2 pack index, and the loose duplicates are removed; thin packs stay as
+loose objects. A single object must still fit in memory while it is read or
+checked out, and pack index tables are loaded in full.
 
 ## Limits
 
@@ -259,7 +261,8 @@ out, and pack index tables are loaded in full.
 - SHA-1 and SHA-256 are supported. Object formats cannot be converted, and a
   dual-hash `compatObjectFormat` repository is refused.
 - Pack files are streamed, but a single object is held in memory while it is
-  read. Pack index tables are loaded in full.
+  read. Pack index tables are loaded in full. Thin packs are not converted
+  into retained packs; their loose objects are kept.
 - Submodules are initialised with `clone --recurse-submodules`,
   `submodule update --init [--recursive] [--remote]`, and `submodule sync`.
   `submodule add`, `deinit`, and branch-aware `--remote` updates are

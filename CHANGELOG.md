@@ -11,6 +11,9 @@
   is at least 50%.
 - HTTP(S) transport negotiates protocol v2 using `ls-refs` and `fetch`, with
   fallback to v0 when the server does not support it.
+- Clone and fetch retain self-contained packs together with a v2 index and
+  remove the loose object duplicates; thin packs continue to use loose
+  objects.
 
 ## 0.3.0.0 - 2026-11-09
 

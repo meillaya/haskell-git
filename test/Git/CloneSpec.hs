@@ -55,6 +55,10 @@ clonesRepositoryWithModesAndRefs =
             assertEqual "refs/heads/main" (cloneLocalBranch result) "Clone should report the local branch"
             indexExists <- doesFileExist (destination </> ".git" </> "index")
             assert indexExists "Clone should write an index"
+            packs <- runBash ("find " ++ show (destination </> ".git" </> "objects" </> "pack") ++ " -name '*.idx' -print 2>/dev/null | wc -l")
+            loose <- runBash ("find " ++ show (destination </> ".git" </> "objects") ++ " -type f ! -path '*/pack/*' | wc -l")
+            assert (read (trim packs) > (0 :: Int)) "Clone should retain a pack index"
+            assertEqual "0" (trim loose) "Clone should remove loose copies after retaining the pack"
             statusText <- runGit ["-C", destination, "status", "--porcelain"]
             assertEqual "" statusText "git status should be clean after clone"
             fsckText <- runGit ["-C", destination, "fsck", "--strict"]

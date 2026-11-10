@@ -39,6 +39,7 @@ import Git.Object.Tree
     , treeEntryObjectId
     )
 import Git.Pack.Import (importPackFile)
+import Git.Pack.Retain (retainPackFile)
 import Git.Protocol.SmartHTTP
     ( DiscoveryAdvertisement
     , DiscoveryRef
@@ -113,6 +114,7 @@ cloneInto remoteUrl destination = do
                         []
                         packPath
                     importPackFile objectFormat repository packPath
+                    retainPackFile objectFormat repository packPath
                 store <- loadStore repository
                 checkoutTree store repository headObjectId
                 writeCheckoutIndex store repository headObjectId
