@@ -3,6 +3,7 @@ module Git.Transport
     , Service (..)
     , Transport (..)
     , parseRemoteUrl
+    , transportUploadPackToFileFor
     , withTemporaryPack
     , withTransport
     ) where
@@ -17,7 +18,7 @@ import qualified Data.ByteString.Lazy as BL
 import Data.Char (isSpace)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (isPrefixOf)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Network.HTTP.Client
     ( BodyReader
     , Manager
@@ -73,17 +74,34 @@ import System.Process
     , waitForProcess
     )
 import Git.Config (Config, configGet, configGetAll)
-import Git.Hash (ObjectId, objectIdToHex)
+import Git.Hash
+    ( HashAlgorithm (..)
+    , ObjectId
+    , hashAlgorithmFromName
+    , objectIdFromHex
+    , objectIdToHex
+    )
 import Git.Protocol.PacketLine
     ( PacketLine (..)
+    , PacketLineV2 (..)
+    , decodePacketLinesV2
+    , encodeDelimPacketV2
     , encodePacketLine
+    , encodePacketLineV2
     , flushPacket
     , packetLine
     , readPacketLineFromHandle
     )
 import Git.Protocol.SmartHTTP
-    ( DiscoveryAdvertisement
+    ( DiscoveryAdvertisement (..)
+    , DiscoveryRef (..)
     , SmartHttpEndpoint (..)
+    , discoveryCapabilities
+    , discoveryObjectFormat
+    , discoveryProtocolVersion
+    , discoveryRefName
+    , discoveryRefObjectId
+    , discoveryRefs
     , defaultSmartHttpEndpoint
     , parseDiscoveryResponseFor
     , parseRefAdvertisement
@@ -114,8 +132,24 @@ data RemoteUrl
 data Transport = Transport
     { transportDiscovery :: Service -> IO DiscoveryAdvertisement
     , transportUploadPackToFile :: [ByteString] -> [ObjectId] -> [ObjectId] -> FilePath -> IO ()
+    , transportUploadPackV2ToFile :: Maybe ([ByteString] -> [ObjectId] -> [ObjectId] -> FilePath -> IO ())
     , transportReceivePack :: ByteString -> Maybe FilePath -> IO ByteString
     }
+
+-- | Dispatch to protocol v2 when the advertisement negotiated it and the
+-- transport implements it; otherwise use the v0 request path.
+transportUploadPackToFileFor
+    :: Transport
+    -> DiscoveryAdvertisement
+    -> [ByteString]
+    -> [ObjectId]
+    -> [ObjectId]
+    -> FilePath
+    -> IO ()
+transportUploadPackToFileFor transport advertisement capabilities wantedIds haves destination =
+    case (discoveryProtocolVersion advertisement, transportUploadPackV2ToFile transport) of
+        (2, Just uploadV2) -> uploadV2 capabilities wantedIds haves destination
+        _ -> transportUploadPackToFile transport capabilities wantedIds haves destination
 
 parseRemoteUrl :: String -> Either String RemoteUrl
 parseRemoteUrl url
@@ -225,6 +259,7 @@ withSshTransport config remote action = do
                 , transportUploadPackToFile =
                     \caps wants haves destination ->
                         sshUploadPack command baseArguments remote caps wants haves destination
+                , transportUploadPackV2ToFile = Nothing
                 , transportReceivePack =
                     \commands maybePack ->
                         sshReceivePack command baseArguments remote commands maybePack
@@ -533,6 +568,7 @@ withGitTransport _config remote action =
                 , transportUploadPackToFile =
                     \caps wants haves destination ->
                         gitUploadPack remote caps wants haves destination
+                , transportUploadPackV2ToFile = Nothing
                 , transportReceivePack =
                     \commands maybePack ->
                         gitReceivePack remote commands maybePack
@@ -631,6 +667,8 @@ withHttpTransport config baseUrl action = do
                 { transportDiscovery = httpDiscovery config endpoint urlAuth
                 , transportUploadPackToFile =
                     httpUploadPack manager config endpoint urlAuth
+                , transportUploadPackV2ToFile =
+                    Just (httpUploadPackV2 manager config endpoint urlAuth)
                 , transportReceivePack =
                     httpReceivePack manager config endpoint urlAuth
                 }
@@ -667,7 +705,11 @@ httpDiscovery config endpoint urlAuth service = do
                 ReceivePackService ->
                     BS8.pack "application/x-git-receive-pack-advertisement"
     baseRequest <- parseRequest path
-    let request = applyRequestConfig config urlAuth baseRequest
+    let protocolRequest =
+            if service == UploadPackService
+                then setRequestHeader (CI.mk (BS8.pack "Git-Protocol")) [BS8.pack "version=2"] baseRequest
+                else baseRequest
+        request = applyRequestConfig config urlAuth protocolRequest
     response <- getWithAuth config path request
     requireSuccess "GET" path response
     case lookup hContentType (getResponseHeaders response) of
@@ -679,14 +721,164 @@ httpDiscovery config endpoint urlAuth service = do
                         ++ maybe "none" BS8.unpack (lookup hContentType (getResponseHeaders response))
                     )
                 )
-    case
-        parseDiscoveryResponseFor
-            (case service of
-                UploadPackService -> BS8.pack "# service=git-upload-pack\n"
-                ReceivePackService -> BS8.pack "# service=git-receive-pack\n")
-            (getResponseBody response) of
+    let body = getResponseBody response
+    case extractV2Capabilities body of
+        Just capabilities
+            | service == UploadPackService ->
+                httpV2Discovery config endpoint urlAuth capabilities
+        _ ->
+            case
+                parseDiscoveryResponseFor
+                    (case service of
+                        UploadPackService -> BS8.pack "# service=git-upload-pack\n"
+                        ReceivePackService -> BS8.pack "# service=git-receive-pack\n")
+                    body of
+                Left err -> ioError (userError err)
+                Right advertisement -> pure advertisement
+
+extractV2Capabilities :: ByteString -> Maybe [ByteString]
+extractV2Capabilities raw =
+    case decodePacketLinesV2 raw of
+        Left _ -> Nothing
+        Right packets -> go packets
+  where
+    go (DataPacketV2 payload : rest)
+        | payload == BS8.pack "version 2\n" = Just (collect rest)
+    go (_ : rest) = go rest
+    go [] = Nothing
+    collect (DataPacketV2 payload : rest) = payload : collect rest
+    collect _ = []
+
+httpV2Discovery
+    :: Config
+    -> SmartHttpEndpoint
+    -> Maybe (ByteString, ByteString)
+    -> [ByteString]
+    -> IO DiscoveryAdvertisement
+httpV2Discovery config endpoint urlAuth capabilities = do
+    manager <- newManager tlsManagerSettings
+    let objectFormat =
+            case capabilityValue (BS8.pack "object-format") capabilities of
+                Just value -> fromMaybe Sha1 (hashAlgorithmFromName value)
+                Nothing -> Sha1
+        requestBody = encodeV2LsRefsRequest capabilities
+    baseRequest <- parseRequest (uploadPackPath endpoint)
+    let request =
+            setRequestMethod (BS8.pack "POST")
+                $ setRequestHeader hContentType [BS8.pack uploadPackRequestContentType]
+                $ setRequestHeader hAccept [BS8.pack uploadPackResultContentType]
+                $ setRequestHeader (CI.mk (BS8.pack "Git-Protocol")) [BS8.pack "version=2"]
+                $ setRequestBodyLBS (BL.fromStrict requestBody)
+                $ applyRequestConfig config urlAuth baseRequest
+    response <- getWithAuth config (uploadPackPath endpoint) request
+    requireSuccess "POST" (uploadPackPath endpoint) response
+    case parseV2LsRefsResponse objectFormat capabilities (getResponseBody response) of
         Left err -> ioError (userError err)
         Right advertisement -> pure advertisement
+  where
+    capabilityValue name advertised =
+        firstJust
+            [ Just (BS.drop (BS.length prefix) capability)
+            | capability <- advertised
+            , prefix `BS8.isPrefixOf` capability
+            ]
+      where
+        prefix = name <> BS8.singleton '='
+
+encodeV2LsRefsRequest :: [ByteString] -> ByteString
+encodeV2LsRefsRequest capabilities =
+    BS.concat
+        ( [ encodePacketLineV2 (DataPacketV2 (BS8.pack "command=ls-refs\n"))
+          , encodePacketLineV2 (DataPacketV2 (BS8.pack "agent=haskell-git/0.3\n"))
+          ]
+            ++ [ encodePacketLineV2 (DataPacketV2 capability)
+               | capability <- capabilities
+               , BS8.pack "object-format=" `BS8.isPrefixOf` capability
+               ]
+            ++ [ encodeDelimPacketV2
+               , encodePacketLineV2 (DataPacketV2 (BS8.pack "peel\n"))
+               , encodePacketLineV2 (DataPacketV2 (BS8.pack "symrefs\n"))
+               , encodePacketLineV2 (DataPacketV2 (BS8.pack "unborn\n"))
+               , encodePacketLineV2 (DataPacketV2 (BS8.pack "ref-prefix refs/heads/\n"))
+               , encodePacketLineV2 (DataPacketV2 (BS8.pack "ref-prefix refs/tags/\n"))
+               , encodePacketLineV2 (DataPacketV2 (BS8.pack "ref-prefix HEAD\n"))
+               , encodePacketLineV2 FlushPacketV2
+               ]
+        )
+
+parseV2LsRefsResponse
+    :: HashAlgorithm
+    -> [ByteString]
+    -> ByteString
+    -> Either String DiscoveryAdvertisement
+parseV2LsRefsResponse objectFormat capabilities raw = do
+    packets <- decodePacketLinesV2 raw
+    let payloads = [payload | DataPacketV2 payload <- packets]
+    foldl addLine (Right (capabilities, [], Nothing :: Maybe ByteString, [])) payloads
+        >>= \(caps, refs, symref, peeled) ->
+            Right
+                ( DiscoveryAdvertisement
+                    (caps ++ maybe [] (\target -> [BS8.pack ("symref=HEAD:" ++ BS8.unpack target)]) symref)
+                    (reverse refs ++ reverse peeled)
+                    objectFormat
+                    2
+                )
+  where
+    addLine result payload = do
+        (caps, refs, symref, peeled) <- result
+        case BS8.words (trimTrailingNewline payload) of
+            (word : refName : attributes)
+                | word == BS8.pack "unborn" ->
+                    Right (caps ++ symrefAttribute attributes, refs, symrefTarget attributes, peeled)
+            (objectIdText : refName : attributes) -> do
+                objectId <-
+                    maybe
+                        (Left ("invalid object id in v2 ls-refs response: " ++ BS8.unpack objectIdText))
+                        Right
+                        (objectIdFromHex (BS8.unpack objectIdText))
+                let symrefCapabilities = symrefAttribute attributes
+                    peeledRefs =
+                        [ DiscoveryRef
+                            (refName <> BS8.pack "^{}")
+                            peeledId
+                        | attribute <- attributes
+                        , Just peeledText <- [stripPrefixBytes (BS8.pack "peeled:") attribute]
+                        , Just peeledId <- [objectIdFromHex (BS8.unpack peeledText)]
+                        ]
+                    nextSymref =
+                        if refName == BS8.pack "HEAD"
+                            then symrefTarget attributes
+                            else symref
+                Right (caps ++ symrefCapabilities, DiscoveryRef refName objectId : refs, nextSymref, peeledRefs ++ peeled)
+            _ -> Right (caps, refs, symref, peeled)
+    symrefAttribute attributes =
+        [ BS8.pack ("symref=HEAD:" ++ BS8.unpack target)
+        | attribute <- attributes
+        , Just target <- [stripPrefixBytes (BS8.pack "symref-target:") attribute]
+        ]
+    symrefTarget attributes =
+        case
+            [ target
+            | attribute <- attributes
+            , Just target <- [stripPrefixBytes (BS8.pack "symref-target:") attribute]
+            ] of
+            target : _ -> Just target
+            [] -> Nothing
+
+stripPrefixBytes :: ByteString -> ByteString -> Maybe ByteString
+stripPrefixBytes prefix value
+    | prefix `BS.isPrefixOf` value = Just (BS.drop (BS.length prefix) value)
+    | otherwise = Nothing
+
+trimTrailingNewline :: ByteString -> ByteString
+trimTrailingNewline = BS8.reverse . BS8.dropWhile (`elem` "\r\n") . BS8.reverse
+
+firstJust :: [Maybe a] -> Maybe a
+firstJust [] = Nothing
+firstJust (value : rest) =
+    case value of
+        Just present -> Just present
+        Nothing -> firstJust rest
 
 httpUploadPack
     :: Manager
@@ -738,6 +930,152 @@ httpUploadPack manager config endpoint urlAuth advertisedCapabilities wantedIds 
                             writeUploadPackBody (responseBody response) destination
                             pure (Right ())
                         else pure (Left status)
+
+httpUploadPackV2
+    :: Manager
+    -> Config
+    -> SmartHttpEndpoint
+    -> Maybe (ByteString, ByteString)
+    -> [ByteString]
+    -> [ObjectId]
+    -> [ObjectId]
+    -> FilePath
+    -> IO ()
+httpUploadPackV2 manager config endpoint urlAuth advertisedCapabilities wantedIds haves destination = do
+    let path = uploadPackPath endpoint
+        requestBody =
+            BL.fromStrict (encodeV2FetchRequest advertisedCapabilities wantedIds haves)
+    baseRequest <- parseRequest path
+    let request =
+            setRequestMethod (BS8.pack "POST")
+                $ setRequestHeader hContentType [BS8.pack uploadPackRequestContentType]
+                $ setRequestHeader hAccept [BS8.pack uploadPackResultContentType]
+                $ setRequestHeader (CI.mk (BS8.pack "Git-Protocol")) [BS8.pack "version=2"]
+                $ setRequestBodyLBS requestBody
+                $ applyRequestConfig config urlAuth baseRequest
+    firstAttempt <- withResponse request manager (writeV2Response destination)
+    case firstAttempt of
+        Right () -> pure ()
+        Left status -> do
+            credentials <- resolveHttpCredentials config (show (getUri baseRequest))
+            case credentials of
+                Nothing ->
+                    ioError (userError ("POST " ++ path ++ " failed with HTTP status " ++ show status))
+                Just (user, password) -> do
+                    let authenticated = applyBasicAuth user password request
+                    retried <- withResponse authenticated manager (writeV2Response destination)
+                    case retried of
+                        Right () -> pure ()
+                        Left retryStatus ->
+                            ioError
+                                ( userError
+                                    ("POST " ++ path ++ " failed with HTTP status " ++ show retryStatus)
+                                )
+  where
+    writeV2Response targetPath response =
+        let status = getResponseStatusCode response
+         in if status == 401
+                then pure (Left 401)
+                else
+                    if status >= 200 && status < 300
+                        then do
+                            writeV2FetchResponse (ByteSource (brRead (responseBody response))) targetPath
+                            pure (Right ())
+                        else pure (Left status)
+
+encodeV2FetchRequest :: [ByteString] -> [ObjectId] -> [ObjectId] -> ByteString
+encodeV2FetchRequest capabilities wantedIds haves =
+    BS.concat
+        ( [ encodePacketLineV2 (DataPacketV2 (BS8.pack "command=fetch\n"))
+          , encodePacketLineV2 (DataPacketV2 (BS8.pack "agent=haskell-git/0.3\n"))
+          ]
+            ++ [ encodePacketLineV2 (DataPacketV2 capability)
+               | capability <- capabilities
+               , BS8.pack "object-format=" `BS8.isPrefixOf` capability
+               ]
+            ++ [ encodeDelimPacketV2
+               , encodePacketLineV2 (DataPacketV2 (BS8.pack "thin-pack\n"))
+               , encodePacketLineV2 (DataPacketV2 (BS8.pack "no-progress\n"))
+               , encodePacketLineV2 (DataPacketV2 (BS8.pack "ofs-delta\n"))
+               ]
+            ++ [ encodePacketLineV2 (DataPacketV2 (BS8.pack ("want " ++ objectIdToHex objectId ++ "\n")))
+               | objectId <- wantedIds
+               ]
+            ++ [ encodePacketLineV2 (DataPacketV2 (BS8.pack ("have " ++ objectIdToHex objectId ++ "\n")))
+               | objectId <- haves
+               ]
+            ++ [ encodePacketLineV2 (DataPacketV2 (BS8.pack "done\n"))
+               , encodePacketLineV2 FlushPacketV2
+               ]
+        )
+
+data V2ResponsePacket
+    = V2Data ByteString
+    | V2Flush
+    | V2Delim
+    | V2End
+    | V2RawPack
+
+readV2ResponsePacket :: BufferedSource -> IO (Either String V2ResponsePacket)
+readV2ResponsePacket buffered = do
+    prefix <- peekExact buffered 4
+    case prefix of
+        Left err -> pure (Left err)
+        Right prefixBytes
+            | prefixBytes == BS8.pack "PACK" -> pure (Right V2RawPack)
+            | otherwise ->
+                case readHex (BS8.unpack prefixBytes) of
+                    [(0, "")] -> do
+                        _ <- takeExact buffered 4
+                        pure (Right V2Flush)
+                    [(1, "")] -> do
+                        _ <- takeExact buffered 4
+                        pure (Right V2Delim)
+                    [(2, "")] -> do
+                        _ <- takeExact buffered 4
+                        pure (Right V2End)
+                    [(packetLength, "")]
+                        | packetLength >= 4 && packetLength <= 65520 -> do
+                            packet <- takeExact buffered packetLength
+                            pure (V2Data . BS.drop 4 <$> packet)
+                    _ ->
+                        pure
+                            ( Left
+                                ( "unexpected protocol v2 response: "
+                                    ++ BS8.unpack (BS.take 20 prefixBytes)
+                                )
+                            )
+
+writeV2FetchResponse :: ByteSource -> FilePath -> IO ()
+writeV2FetchResponse source destination =
+    withBinaryFile destination WriteMode $ \outputHandle -> do
+        buffered <- newBufferedSource source
+        loop buffered outputHandle False
+  where
+    loop buffered outputHandle inPack = do
+        packet <- readV2ResponsePacket buffered
+        case packet of
+            Left err -> ioError (userError err)
+            Right V2RawPack -> writeBuffered buffered outputHandle
+            Right V2Flush ->
+                if inPack then pure () else loop buffered outputHandle inPack
+            Right V2Delim -> loop buffered outputHandle inPack
+            Right V2End -> pure ()
+            Right (V2Data payload)
+                | payload == BS8.pack "packfile\n" ->
+                    loop buffered outputHandle True
+                | inPack ->
+                    case BS.uncons payload of
+                        Just (1, bytes) -> do
+                            BS.hPut outputHandle bytes
+                            loop buffered outputHandle inPack
+                        Just (2, _) -> loop buffered outputHandle inPack
+                        Just (3, message) ->
+                            ioError (userError ("remote error: " ++ BS8.unpack message))
+                        _ -> ioError (userError "unexpected sideband packet in protocol v2 fetch")
+                | payload == BS8.pack "acknowledgments\n" ->
+                    loop buffered outputHandle inPack
+                | otherwise -> loop buffered outputHandle inPack
 
 httpReceivePack
     :: Manager

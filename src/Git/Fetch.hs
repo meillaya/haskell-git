@@ -39,6 +39,7 @@ import Git.Store (Store, loadStore, readObjectOrFail, walkCommits)
 import Git.Transport
     ( Service (..)
     , Transport (..)
+    , transportUploadPackToFileFor
     , parseRemoteUrl
     , withTemporaryPack
     , withTransport
@@ -117,8 +118,9 @@ fetchRepository repository remoteArgument explicitRefSpecs options = do
             wantedIds = nub (fetchedRefs ++ tagIds)
         when (not (null wantedIds)) $
             withTemporaryPack $ \packPath -> do
-                transportUploadPackToFile
+                transportUploadPackToFileFor
                     transport
+                    advertisement
                     (discoveryCapabilities advertisement)
                     wantedIds
                     haves

@@ -275,8 +275,8 @@ out, and pack index tables are loaded in full.
   renames whose contents changed by at least 50% similarity. Conflicts are
   still resolved at file granularity.
 - Fetch sends `have` lines for a compact negotiation and auto-follows tags
-  reachable from fetched branches; `--tags` fetches every tag. Protocol v2 is
-  not implemented.
+  reachable from fetched branches; `--tags` fetches every tag. HTTP(S) uses
+  protocol v2 (`ls-refs` and `fetch`); SSH and git:// still use v0.
 - Push works over Smart HTTP, SSH, and git:// (the daemon must enable
   receive-pack).
 - Reflogs are written for `HEAD` and local branches with generic

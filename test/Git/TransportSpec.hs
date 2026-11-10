@@ -25,6 +25,7 @@ import TestSupport
     , assertEqual
     , runBash
     , runGit
+    , withHttpBackendServerV2
     , withTempDirectory
     )
 
@@ -34,6 +35,7 @@ run = do
     sshPush
     gitDaemonCloneAndFetch
     gitDaemonPush
+    httpProtocolV2CloneAndFetch
 
 sshCloneAndFetch :: IO ()
 sshCloneAndFetch =
@@ -100,6 +102,35 @@ sshPush =
             remoteText <- runGit ["-C", bareRepository, "rev-parse", "refs/heads/main"]
             localText <- runGit ["-C", destination, "rev-parse", "HEAD"]
             assertEqual localText remoteText "SSH push should update the remote branch"
+
+httpProtocolV2CloneAndFetch :: IO ()
+httpProtocolV2CloneAndFetch =
+    withTempDirectory "haskell-git-http-v2" $ \temporaryDir -> do
+        let sourceDirectory = temporaryDir </> "source"
+            serveDirectory = temporaryDir </> "serve"
+            bareRepository = serveDirectory </> "repo.git"
+            destination = temporaryDir </> "clone"
+        _ <- createSource sourceDirectory
+        createDirectoryIfMissing True serveDirectory
+        _ <- runGit ["clone", "-q", "--bare", sourceDirectory, bareRepository]
+        withHttpBackendServerV2 serveDirectory "repo.git" $ \remoteUrl -> do
+            result <- cloneRepository remoteUrl destination
+            assert (cloneHead result /= Nothing) "protocol v2 clone should fetch a HEAD"
+            statusText <- runGit ["-C", destination, "status", "--porcelain"]
+            assertEqual "" statusText "protocol v2 clone should be clean"
+            _ <- runGit ["-C", sourceDirectory, "config", "user.email", "ada@example.com"]
+            _ <- runGit ["-C", sourceDirectory, "config", "user.name", "Ada"]
+            writeFile (sourceDirectory </> "second.txt") "second\n"
+            _ <- runGit ["-C", sourceDirectory, "add", "-A"]
+            _ <- runGit ["-C", sourceDirectory, "commit", "-qm", "second"]
+            _ <- runGit ["-C", sourceDirectory, "push", "-q", bareRepository, "main"]
+            repository <- requireRepository destination
+            _ <- fetchRepository repository "origin" [] defaultFetchOptions
+            fetchedHead <- trim <$> runGit ["-C", destination, "rev-parse", "refs/remotes/origin/main"]
+            sourceHead <- trim <$> runGit ["-C", sourceDirectory, "rev-parse", "HEAD"]
+            assertEqual sourceHead fetchedHead "protocol v2 fetch should update the tracking ref"
+            _ <- runGit ["-C", destination, "fsck", "--strict"]
+            pure ()
 
 gitDaemonCloneAndFetch :: IO ()
 gitDaemonCloneAndFetch =

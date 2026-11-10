@@ -1,11 +1,12 @@
 module Git.Protocol.SmartHTTP
-    ( DiscoveryAdvertisement
-    , DiscoveryRef
+    ( DiscoveryAdvertisement (..)
+    , DiscoveryRef (..)
     , SmartHttpEndpoint (..)
     , capabilityValue
     , defaultSmartHttpEndpoint
     , discoveryCapabilities
     , discoveryObjectFormat
+    , discoveryProtocolVersion
     , discoveryRefName
     , discoveryRefObjectId
     , discoveryRefs
@@ -47,6 +48,7 @@ data DiscoveryAdvertisement = DiscoveryAdvertisement
     { discoveryCapabilities :: [ByteString]
     , discoveryRefs :: [DiscoveryRef]
     , discoveryObjectFormat :: HashAlgorithm
+    , discoveryProtocolVersion :: Int
     }
     deriving (Eq, Show)
 
@@ -107,13 +109,13 @@ parseRefAdvertisement = parseRefs
 parseRefs :: [ByteString] -> Either String DiscoveryAdvertisement
 parseRefs refLines =
     case filter (not . BS.null) refLines of
-        [] -> Right (DiscoveryAdvertisement [] [] defaultHashAlgorithm)
+        [] -> Right (DiscoveryAdvertisement [] [] defaultHashAlgorithm 0)
         firstRef : remainingRefs -> do
             (firstDiscoveryRef, capabilities) <- parseFirstRef firstRef
             objectFormat <- resolveObjectFormat capabilities firstDiscoveryRef
             validateRefObjectFormat objectFormat firstDiscoveryRef
             if isCapabilitiesPseudoRef firstDiscoveryRef
-                then Right (DiscoveryAdvertisement capabilities [] objectFormat)
+                then Right (DiscoveryAdvertisement capabilities [] objectFormat 0)
                 else do
                     otherRefs <- traverse (parseSubsequentRef objectFormat) remainingRefs
                     Right
@@ -121,6 +123,7 @@ parseRefs refLines =
                             capabilities
                             (firstDiscoveryRef : otherRefs)
                             objectFormat
+                            0
                         )
 
 resolveObjectFormat :: [ByteString] -> DiscoveryRef -> Either String HashAlgorithm

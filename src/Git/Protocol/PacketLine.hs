@@ -1,7 +1,12 @@
 module Git.Protocol.PacketLine
     ( PacketLine (..)
+    , PacketLineV2 (..)
     , decodePacketLines
+    , decodePacketLinesV2
+    , encodeDelimPacketV2
     , encodePacketLine
+    , encodePacketLineV2
+    , encodeResponseEndPacketV2
     , flushPacket
     , flushPacketLength
     , packetLine
@@ -38,6 +43,55 @@ encodePacketLine FlushPacket = BS8.pack "0000"
 encodePacketLine (DataPacket payload) =
     let totalLength = BS.length payload + 4
      in BS8.pack (padHex totalLength) <> payload
+
+data PacketLineV2
+    = DataPacketV2 ByteString
+    | FlushPacketV2
+    | DelimPacketV2
+    | ResponseEndPacketV2
+    deriving (Eq, Show)
+
+encodePacketLineV2 :: PacketLineV2 -> ByteString
+encodePacketLineV2 FlushPacketV2 = BS8.pack "0000"
+encodePacketLineV2 DelimPacketV2 = BS8.pack "0001"
+encodePacketLineV2 ResponseEndPacketV2 = BS8.pack "0002"
+encodePacketLineV2 (DataPacketV2 payload) =
+    let totalLength = BS.length payload + 4
+     in BS8.pack (padHex totalLength) <> payload
+
+encodeDelimPacketV2 :: ByteString
+encodeDelimPacketV2 = encodePacketLineV2 DelimPacketV2
+
+encodeResponseEndPacketV2 :: ByteString
+encodeResponseEndPacketV2 = encodePacketLineV2 ResponseEndPacketV2
+
+decodePacketLinesV2 :: ByteString -> Either String [PacketLineV2]
+decodePacketLinesV2 rawBytes
+    | BS.null rawBytes = Right []
+    | BS.length rawBytes < 4 = Left "Malformed pkt-line stream: truncated length prefix"
+    | otherwise = do
+        let (lengthPrefix, remaining) = BS.splitAt 4 rawBytes
+        packetLength <- parseLengthV2 lengthPrefix
+        case packetLength of
+            0 -> (FlushPacketV2 :) <$> decodePacketLinesV2 remaining
+            1 -> (DelimPacketV2 :) <$> decodePacketLinesV2 remaining
+            2 -> (ResponseEndPacketV2 :) <$> decodePacketLinesV2 remaining
+            _ ->
+                if packetLength <= specialPacketLimit
+                    then Left "Malformed pkt-line stream: invalid packet length"
+                    else do
+                        let payloadLength = packetLength - 4
+                        if BS.length remaining < payloadLength
+                            then Left "Malformed pkt-line stream: truncated payload"
+                            else do
+                                let (payload, rest) = BS.splitAt payloadLength remaining
+                                (DataPacketV2 payload :) <$> decodePacketLinesV2 rest
+  where
+    parseLengthV2 prefix =
+        case readHex (BS8.unpack prefix) of
+            [(parsedLength, "")] | parsedLength <= maximumPacketLength -> Right parsedLength
+            [(_, "")] -> Left "Malformed pkt-line stream: length prefix overflows the maximum"
+            _ -> Left "Malformed pkt-line stream: invalid length prefix"
 
 decodePacketLines :: ByteString -> Either String [PacketLine]
 decodePacketLines rawBytes

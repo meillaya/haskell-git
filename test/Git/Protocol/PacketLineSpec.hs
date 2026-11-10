@@ -5,8 +5,13 @@ module Git.Protocol.PacketLineSpec
 import Data.List (isInfixOf)
 import qualified Data.ByteString.Char8 as BS8
 import Git.Protocol.PacketLine
-    ( decodePacketLines
+    ( PacketLineV2 (..)
+    , decodePacketLines
+    , decodePacketLinesV2
+    , encodeDelimPacketV2
     , encodePacketLine
+    , encodePacketLineV2
+    , encodeResponseEndPacketV2
     , flushPacket
     , packetLine
     , packetLinePayload
@@ -21,6 +26,7 @@ run = do
     emptyDataPacket
     rejectsMalformed
     specialPackets
+    v2RoundTrip
 
 -- | Round-trip a data packet and a flush packet.
 roundTrip :: IO ()
@@ -60,6 +66,23 @@ rejectsMalformed = do
         Right _ -> fail "A truncated length prefix should be rejected"
 
 -- | Check that protocol v2 special packets are refused by name.
+v2RoundTrip :: IO ()
+v2RoundTrip = do
+    let encoded =
+            encodePacketLineV2 (DataPacketV2 (BS8.pack "command=ls-refs\n"))
+                <> encodeDelimPacketV2
+                <> encodePacketLineV2 FlushPacketV2
+                <> encodeResponseEndPacketV2
+    decoded <- either fail pure (decodePacketLinesV2 encoded)
+    assertEqual
+        [ DataPacketV2 (BS8.pack "command=ls-refs\n")
+        , DelimPacketV2
+        , FlushPacketV2
+        , ResponseEndPacketV2
+        ]
+        decoded
+        "The v2 pkt-line codec should preserve data, delimiter, flush, and response-end packets"
+
 specialPackets :: IO ()
 specialPackets = do
     case decodePacketLines (BS8.pack "0001") of

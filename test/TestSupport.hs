@@ -5,6 +5,7 @@ module TestSupport
     , runBash
     , runGit
     , withHttpBackendServer
+    , withHttpBackendServerV2
     , withAuthenticatedHttpBackendServer
     , withTempDirectory
     ) where
@@ -96,11 +97,25 @@ cleanupTempDirectory directoryPath = do
 -- action receives the clone URL. The project root is the directory that holds
 -- the repository directory named by the second argument.
 withHttpBackendServer :: FilePath -> String -> (String -> IO a) -> IO a
-withHttpBackendServer projectRoot repositoryName action =
+withHttpBackendServer =
+    withHttpBackendServerUsing httpBackendServerScript
+
+withHttpBackendServerV2 :: FilePath -> String -> (String -> IO a) -> IO a
+withHttpBackendServerV2 =
+    withHttpBackendServerUsing
+        (httpBackendServerScriptWith "        'GIT_PROTOCOL': 'version=2',")
+
+withHttpBackendServerUsing
+    :: String
+    -> FilePath
+    -> String
+    -> (String -> IO a)
+    -> IO a
+withHttpBackendServerUsing scriptText projectRoot repositoryName action =
     withTempDirectory "haskell-git-http" $ \serverDirectory -> do
         let scriptPath = serverDirectory </> "server.py"
             portPath = serverDirectory </> "port.txt"
-        writeFile scriptPath httpBackendServerScript
+        writeFile scriptPath scriptText
         bracket
             (startServer scriptPath portPath)
             stopServer
@@ -134,7 +149,10 @@ trim :: String -> String
 trim = reverse . dropWhile (`elem` "\r\n") . reverse
 
 httpBackendServerScript :: String
-httpBackendServerScript =
+httpBackendServerScript = httpBackendServerScriptWith ""
+
+httpBackendServerScriptWith :: String -> String
+httpBackendServerScriptWith extraEnvironment =
     unlines
         [ "import http.server"
         , "import os"
@@ -153,6 +171,7 @@ httpBackendServerScript =
         , "        'CONTENT_LENGTH': str(len(body)),"
         , "        'REMOTE_ADDR': '127.0.0.1',"
         , "        'PATH': os.environ.get('PATH', '/usr/bin:/bin'),"
+        , extraEnvironment
         , "    }"
         , "    result = subprocess.run(['git', 'http-backend'], input=body, env=env, capture_output=True)"
         , "    stdout = result.stdout"

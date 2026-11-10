@@ -66,6 +66,7 @@ import Git.Store (Store, flattenTree, loadStore, readObjectOrFail, storeReposito
 import Git.Transport
     ( Service (..)
     , Transport (..)
+    , transportUploadPackToFileFor
     , parseRemoteUrl
     , withTemporaryPack
     , withTransport
@@ -104,8 +105,9 @@ cloneInto remoteUrl destination = do
                 headObjectId <- requireDefaultHead defaultBranchPath branchRefs
                 let wantedIds = nub (map discoveryRefObjectId (branchRefs ++ tagRefs))
                 withTemporaryPack $ \packPath -> do
-                    transportUploadPackToFile
+                    transportUploadPackToFileFor
                         transport
+                        advertisement
                         (discoveryCapabilities advertisement)
                         wantedIds
                         []

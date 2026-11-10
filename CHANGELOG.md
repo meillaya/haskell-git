@@ -9,6 +9,8 @@
   through symlinked parent directories.
 - Merge detects renames whose contents also changed when the text similarity
   is at least 50%.
+- HTTP(S) transport negotiates protocol v2 using `ls-refs` and `fetch`, with
+  fallback to v0 when the server does not support it.
 
 ## 0.3.0.0 - 2026-11-09
 
