@@ -12,10 +12,11 @@ module Git.Merge
     , treeOfCommit
     ) where
 
-import Control.Monad (foldM, forM_, when)
+import Control.Monad (foldM, forM, forM_, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
-import Data.List (nub, sort)
+import Data.List (maximumBy, nub, sort)
+import Data.Ord (comparing)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import System.Directory
@@ -25,7 +26,7 @@ import System.Directory
     )
 import System.FilePath ((</>), takeDirectory)
 import Git.Commit (commitCurrentIndex)
-import Git.Diff (mergeTextContent)
+import Git.Diff (contentSimilarity, mergeTextContent)
 import Git.Hash (ObjectId, objectIdFromHexFor, objectIdToHex)
 import Git.Index
     ( IndexEntry (..)
@@ -132,8 +133,10 @@ mergeRepositoryWith mergeOptions repository store targetId = do
                             let baseMap = entryMap baseEntries
                                 ourMap = entryMap ourEntries
                                 theirMap = entryMap theirEntries
-                                (ourRenames, ourNormalized) = detectRenames baseMap ourMap
-                                (theirRenames, theirNormalized) = detectRenames baseMap theirMap
+                            (ourRenames, ourNormalized) <-
+                                detectRenames store baseMap ourMap
+                            (theirRenames, theirNormalized) <-
+                                detectRenames store baseMap theirMap
                             (rawResolved, rawConflicts) <-
                                 mergeEntryMaps
                                     repository
@@ -176,51 +179,95 @@ mergeRepositoryWith mergeOptions repository store targetId = do
   where
     entryMap = Map.fromList . map (\(path, entry) -> (path, entry))
 
--- | Detect exact-content renames from base to one side. The side map is
--- normalised back to the base path so the ordinary three-way merge can reason
--- about content, while the rename map records where the result belongs.
+-- | Detect renames from base to one side. Exact-content matches are preferred;
+-- otherwise text similarity above 50% is used, which covers renames whose
+-- contents were also edited.
 detectRenames
-    :: Map.Map FilePath TreeEntry
+    :: Store
     -> Map.Map FilePath TreeEntry
-    -> (Map.Map FilePath (FilePath, TreeEntry), Map.Map FilePath TreeEntry)
-detectRenames baseMap sideMap =
-    (renameMap, normalized)
+    -> Map.Map FilePath TreeEntry
+    -> IO (Map.Map FilePath (FilePath, TreeEntry), Map.Map FilePath TreeEntry)
+detectRenames store baseMap sideMap = do
+    let deleted =
+            [ (basePath, entry)
+            | (basePath, entry) <- Map.toList baseMap
+            , Map.notMember basePath sideMap
+            , renameable entry
+            ]
+        added =
+            [ (sidePath, entry)
+            | (sidePath, entry) <- Map.toList sideMap
+            , Map.notMember sidePath baseMap
+            , renameable entry
+            ]
+        exactCandidates =
+            [ (basePath, sidePath, sideEntry)
+            | (basePath, baseEntry) <- deleted
+            , (sidePath, sideEntry) <- added
+            , treeEntryObjectId sideEntry == treeEntryObjectId baseEntry
+            ]
+        exactTargetCounts =
+            Map.fromListWith
+                (+)
+                [(sidePath, 1 :: Int) | (_, sidePath, _) <- exactCandidates]
+        exactMatches =
+            [ (basePath, (sidePath, sideEntry))
+            | (basePath, sidePath, sideEntry) <- exactCandidates
+            , Map.findWithDefault 0 sidePath exactTargetCounts == 1
+            ]
+        usedBasePaths = Set.fromList [basePath | (basePath, _) <- exactMatches]
+        usedSidePaths = Set.fromList [sidePath | (_, (sidePath, _)) <- exactMatches]
+        remainingDeleted =
+            [ entry | entry@(basePath, _) <- deleted, not (Set.member basePath usedBasePaths) ]
+        remainingAdded =
+            [ entry | entry@(sidePath, _) <- added, not (Set.member sidePath usedSidePaths) ]
+    scored <-
+        forM remainingDeleted $ \(basePath, baseEntry) -> do
+            basePayload <- renamePayload store baseEntry
+            similarities <-
+                forM remainingAdded $ \(sidePath, sideEntry) -> do
+                    sidePayload <- renamePayload store sideEntry
+                    pure
+                        ( contentSimilarity basePayload sidePayload
+                        , sidePath
+                        , sideEntry
+                        )
+            let best =
+                    maximumBy
+                        (comparing (\(score, _, _) -> score))
+                        ((0, "", baseEntry) : similarities)
+            pure (basePath, best)
+    let targetBest =
+            Map.fromListWith
+                maxScored
+                [(sidePath, (score, basePath, sideEntry)) | (basePath, (score, sidePath, sideEntry)) <- scored]
+        similarityMatches =
+            [ (basePath, (sidePath, sideEntry))
+            | (basePath, (score, sidePath, sideEntry)) <- scored
+            , score >= 0.5
+            , Map.lookup sidePath targetBest == Just (score, basePath, sideEntry)
+            ]
+        matches = exactMatches ++ similarityMatches
+        renameMap = Map.fromList matches
+        renamedTargets = Set.fromList [sidePath | (_, (sidePath, _)) <- matches]
+        withoutTargets =
+            foldr Map.delete sideMap (Set.toList renamedTargets)
+        normalized =
+            Map.union
+                (Map.fromList [(basePath, entry) | (basePath, (_, entry)) <- matches])
+                withoutTargets
+    pure (renameMap, normalized)
   where
-    deleted =
-        [ (basePath, entry)
-        | (basePath, entry) <- Map.toList baseMap
-        , Map.notMember basePath sideMap
-        , renameable entry
-        ]
-    added =
-        [ (sidePath, entry)
-        | (sidePath, entry) <- Map.toList sideMap
-        , Map.notMember sidePath baseMap
-        , renameable entry
-        ]
-    candidateMatches =
-        [ (basePath, sidePath, sideEntry)
-        | (basePath, baseEntry) <- deleted
-        , (sidePath, sideEntry) <- added
-        , treeEntryObjectId sideEntry == treeEntryObjectId baseEntry
-        ]
-    targetCounts =
-        Map.fromListWith
-            (+)
-            [(sidePath, 1 :: Int) | (_, sidePath, _) <- candidateMatches]
-    matches =
-        [ (basePath, (sidePath, entry))
-        | (basePath, sidePath, entry) <- candidateMatches
-        , Map.findWithDefault 0 sidePath targetCounts == 1
-        ]
-    renameMap = Map.fromList matches
-    renamedTargets = Set.fromList [sidePath | (_, (sidePath, _)) <- matches]
-    withoutTargets =
-        foldr Map.delete sideMap (Set.toList renamedTargets)
-    normalized =
-        Map.union
-            (Map.fromList [(basePath, entry) | (basePath, (_, entry)) <- matches])
-            withoutTargets
+    maxScored left right =
+        if fst3 left >= fst3 right then left else right
+    fst3 (first, _, _) = first
+
+renamePayload :: Store -> TreeEntry -> IO BS.ByteString
+renamePayload store entry = do
+    objectValue <- readObjectOrFail store (treeEntryObjectId entry)
+    case gitObjectType objectValue of
+        BlobObject -> pure (gitObjectPayload objectValue)
+        _ -> pure BS.empty
 
 renameable :: TreeEntry -> Bool
 renameable entry =

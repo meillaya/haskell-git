@@ -7,6 +7,8 @@
   `submodule update --remote` are implemented.
 - Checkout refuses trees containing `.git` components and refuses to write
   through symlinked parent directories.
+- Merge detects renames whose contents also changed when the text similarity
+  is at least 50%.
 
 ## 0.3.0.0 - 2026-11-09
 

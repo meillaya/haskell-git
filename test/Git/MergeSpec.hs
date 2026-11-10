@@ -31,6 +31,7 @@ run = do
     mergesNonOverlappingChanges
     mergesNonOverlappingLines
     mergesRenames
+    mergesModifiedRenames
     fastForwards
     noFastForwardCreatesCommit
     ffOnlyRejectsDivergence
@@ -128,6 +129,37 @@ mergesRenames =
         assert (not oldExists) "the old path should be gone after merge"
         statusText <- runGit ["-C", temporaryDir, "status", "--porcelain"]
         assertEqual "" statusText "Rename merge should be clean"
+
+mergesModifiedRenames :: IO ()
+mergesModifiedRenames =
+    withTempDirectory "haskell-git-merge-rename-mod" $ \temporaryDir -> do
+        _ <- runGit ["init", "-q", "-b", "main", temporaryDir]
+        _ <- runGit ["-C", temporaryDir, "config", "user.email", "ada@example.com"]
+        _ <- runGit ["-C", temporaryDir, "config", "user.name", "Ada"]
+        writeFile (temporaryDir </> "old.txt") "one\ntwo\nthree\n"
+        _ <- runGit ["-C", temporaryDir, "add", "-A"]
+        _ <- runGit ["-C", temporaryDir, "commit", "-qm", "base"]
+        _ <- runGit ["-C", temporaryDir, "checkout", "-q", "-b", "feature"]
+        _ <- runGit ["-C", temporaryDir, "mv", "old.txt", "new.txt"]
+        writeFile (temporaryDir </> "new.txt") "one\ntwo\nthree changed\n"
+        _ <- runGit ["-C", temporaryDir, "commit", "-qam", "rename and edit"]
+        _ <- runGit ["-C", temporaryDir, "checkout", "-q", "main"]
+        writeFile (temporaryDir </> "old.txt") "one changed\ntwo\nthree\n"
+        _ <- runGit ["-C", temporaryDir, "commit", "-qam", "edit original"]
+        repository <- requireRepository temporaryDir
+        store <- loadStore repository
+        target <- resolveCommit repository "feature"
+        result <- mergeRepository repository store target
+        case result of
+            MergeCreated _ -> pure ()
+            MergeConflicted paths -> fail ("modified rename should merge cleanly, got conflicts " ++ show paths)
+            _ -> fail "expected a merge commit for a modified rename"
+        contents <- readFile (temporaryDir </> "new.txt")
+        assertEqual "one changed\ntwo\nthree changed\n" contents "Both edits should survive the rename"
+        oldExists <- doesFileExist (temporaryDir </> "old.txt")
+        assert (not oldExists) "The old path should be removed after a renamed merge"
+        statusText <- runGit ["-C", temporaryDir, "status", "--porcelain"]
+        assertEqual "" statusText "Modified rename merge should be clean"
 
 fastForwards :: IO ()
 fastForwards =

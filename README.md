@@ -271,9 +271,9 @@ out, and pack index tables are loaded in full.
   --set-upstream`, and `push --force-with-lease`. Interactive rebase, octopus
   merges, hooks, signed-commit verification, shallow/partial clone, LFS, and
   Windows remain out of scope.
-- Merge uses a line-level diff3 and detects exact-content renames. Renames
-  whose contents also changed are not detected, and conflicts are still
-  resolved at file granularity.
+- Merge uses a line-level diff3 and detects exact-content renames, plus
+  renames whose contents changed by at least 50% similarity. Conflicts are
+  still resolved at file granularity.
 - Fetch sends `have` lines for a compact negotiation and auto-follows tags
   reachable from fetched branches; `--tags` fetches every tag. Protocol v2 is
   not implemented.

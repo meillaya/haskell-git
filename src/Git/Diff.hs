@@ -2,6 +2,7 @@
 
 module Git.Diff
     ( Hunk (..)
+    , contentSimilarity
     , diffHunks
     , mergeTextContent
     ) where
@@ -13,6 +14,7 @@ import Data.Array.ST (STUArray, newArray, readArray, writeArray)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
+import Data.Maybe (fromMaybe)
 import Data.Word (Word8)
 
 -- | One replacement in a line diff. The base range is half-open, and the
@@ -23,6 +25,47 @@ data Hunk = Hunk
     , hunkReplacement :: [ByteString]
     }
     deriving (Eq, Show)
+
+-- | A rough text similarity in [0,1], used for rename detection. It combines
+-- unchanged-line ratio with common byte prefix/suffix, which handles both
+-- large files and small one-line edits.
+contentSimilarity :: ByteString -> ByteString -> Double
+contentSimilarity left right
+    | BS.null left && BS.null right = 1
+    | BS.elem 0 (BS.take 8000 left) || BS.elem 0 (BS.take 8000 right) = 0
+    | otherwise = max lineRatio byteRatio
+  where
+    maxLength = max (BS.length left) (BS.length right)
+    commonPrefix = length (takeWhile id (BS.zipWith (==) left right))
+    commonSuffix =
+        length
+            ( takeWhile id
+                ( BS.zipWith
+                    (==)
+                    (BS.reverse left)
+                    (BS.reverse right)
+                )
+            )
+    byteRatio =
+        if maxLength == 0
+            then 1
+            else
+                fromIntegral (min maxLength (commonPrefix + commonSuffix))
+                    / fromIntegral maxLength
+    (leftLines, _) = splitLines left
+    (rightLines, _) = splitLines right
+    lineRatio =
+        case diffHunks leftLines rightLines of
+            Nothing -> 0
+            Just hunks ->
+                let baseLength = length leftLines
+                    targetLength = length rightLines
+                    denominator = max baseLength targetLength
+                    changed = sum [hunkBaseEnd hunk - hunkBaseStart hunk | hunk <- hunks]
+                    kept = max 0 (baseLength - changed)
+                 in if denominator == 0
+                        then 1
+                        else fromIntegral kept / fromIntegral denominator
 
 -- | Line-level three-way merge. Two changed regions may be combined when they
 -- touch different base lines; overlapping edits conflict.
