@@ -124,11 +124,14 @@ import Git.Repo
     )
 import Git.Store (Store, flattenTree, loadStore, objectExists, readObjectOrFail, walkCommits)
 import Git.Submodule
-    ( initialiseSubmodules
+    ( addSubmodule
+    , deinitSubmodule
+    , initialiseSubmodules
     , readSubmodules
     , submoduleStatus
     , submoduleSync
     , updateSubmodules
+    , updateSubmodulesRemote
     )
 import Git.Verify (VerifyReport (..), renderVerifyReport, verifyRepository)
 import System.Directory
@@ -208,8 +211,10 @@ data RebaseAction
 
 data SubmoduleAction
     = SubmoduleStatus
-    | SubmoduleUpdate Bool
+    | SubmoduleUpdate Bool Bool
     | SubmoduleSync
+    | SubmoduleAdd String (Maybe FilePath) (Maybe String)
+    | SubmoduleDeinit String
 
 data RemoteAction
     = RemoteAdd String String
@@ -425,9 +430,36 @@ parseClone _ _ = Left "haskell-git: usage: clone [--recurse-submodules] <url> [<
 
 parseSubmodule :: [String] -> Either String Command
 parseSubmodule ["status"] = Right (SubmoduleCommand SubmoduleStatus)
-parseSubmodule ("update":rest) = Right (SubmoduleCommand (SubmoduleUpdate ("--recursive" `elem` rest)))
+parseSubmodule ("update":rest) =
+    Right
+        ( SubmoduleCommand
+            ( SubmoduleUpdate
+                ("--recursive" `elem` rest)
+                ("--remote" `elem` rest)
+            )
+        )
 parseSubmodule ["sync"] = Right (SubmoduleCommand SubmoduleSync)
-parseSubmodule _ = Left "haskell-git: usage: submodule status | update --init [--recursive] | sync"
+parseSubmodule ("add":rest) = parseSubmoduleAdd rest
+parseSubmodule ["deinit", path] = Right (SubmoduleCommand (SubmoduleDeinit path))
+parseSubmodule _ =
+    Left
+        "haskell-git: usage: submodule status | update --init [--recursive] [--remote] | sync | add <url> [<path>] | deinit <path>"
+
+parseSubmoduleAdd :: [String] -> Either String Command
+parseSubmoduleAdd arguments =
+    case go arguments Nothing [] of
+        Right (branch, positionals) ->
+            case positionals of
+                [url] -> Right (SubmoduleCommand (SubmoduleAdd url Nothing branch))
+                [url, path] -> Right (SubmoduleCommand (SubmoduleAdd url (Just path) branch))
+                _ -> Left "haskell-git: usage: submodule add [-b <branch>] <url> [<path>]"
+        Left err -> Left err
+  where
+    go [] branch positionals = Right (branch, reverse positionals)
+    go ("-b":branch:rest) _ positionals = go rest (Just branch) positionals
+    go (argument:rest) branch positionals
+        | "-" `isPrefixOf` argument = Left ("haskell-git: submodule add does not understand " ++ argument)
+        | otherwise = go rest branch (argument : positionals)
 
 parseRemote :: [String] -> Either String Command
 parseRemote [] = Right (RemoteCommand RemoteList)
@@ -571,7 +603,8 @@ usageText =
         , "  rebase [--abort|--continue|--skip] upstream"
         , "  rebase --onto <newbase> <upstream>"
         , "                                   replay the current branch"
-        , "  submodule status|update --init|sync"
+        , "  submodule status|update --init [--recursive] [--remote]"
+        , "  submodule sync|add <url> [<path>]|deinit <path>"
         , "                                   manage submodules"
         , "  remote add|set-url|get-url ...   manage remotes"
         , "  verify [path]                    check objects and references"
@@ -942,8 +975,15 @@ runCommand (SubmoduleCommand action) = do
     store <- loadStore repository
     case action of
         SubmoduleStatus -> mapM_ putStrLn =<< submoduleStatus repository store
-        SubmoduleUpdate recursive -> updateSubmodules repository store recursive
+        SubmoduleUpdate recursive remoteUpdate ->
+            if remoteUpdate
+                then updateSubmodulesRemote repository store recursive
+                else updateSubmodules repository store recursive
         SubmoduleSync -> submoduleSync repository
+        SubmoduleAdd url maybePath maybeBranch -> do
+            _ <- addSubmodule repository url maybePath maybeBranch
+            pure ()
+        SubmoduleDeinit path -> deinitSubmodule repository path
 
 runCommand (RemoteCommand action) = do
     repository <- requireRepository "."

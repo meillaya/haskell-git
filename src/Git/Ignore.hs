@@ -5,8 +5,12 @@ module Git.Ignore
     ) where
 
 import Data.Char (isSpace)
-import Data.List (isPrefixOf)
-import System.Directory (doesFileExist)
+import Data.List (isPrefixOf, sortOn)
+import System.Directory
+    ( doesDirectoryExist
+    , doesFileExist
+    , listDirectory
+    )
 import System.FilePath ((</>))
 import Git.Repo (Repository (..), repositoryGitDir, repositoryRootDir)
 
@@ -15,33 +19,63 @@ data IgnoreRule = IgnoreRule
     , ignoreNegated :: Bool
     , ignoreDirectoryOnly :: Bool
     , ignoreAnchored :: Bool
+    , ignoreBaseDir :: FilePath
     }
     deriving (Eq, Show)
 
--- | Load the root .gitignore and .git/info/exclude. Nested .gitignore files
--- are not yet consulted.
+-- | Load every .gitignore under the worktree plus .git/info/exclude. Deeper
+-- rules are returned later so they take precedence, matching git.
 loadIgnoreRules :: Repository -> IO [IgnoreRule]
 loadIgnoreRules repository = do
-    rootRules <- readRules (repositoryRootDir repository </> ".gitignore")
+    ignoreFiles <- findIgnoreFiles (repositoryRootDir repository) ""
+    rules <- concat <$> traverse (uncurry readRules) ignoreFiles
     excludeRules <-
-        readRules (repositoryGitDir repository </> "info" </> "exclude")
-    pure (rootRules ++ excludeRules)
+        readRules "" (repositoryGitDir repository </> "info" </> "exclude")
+    pure (sortOn (length . splitComponents . ignoreBaseDir) (rules ++ excludeRules))
 
-readRules :: FilePath -> IO [IgnoreRule]
-readRules path = do
+findIgnoreFiles :: FilePath -> FilePath -> IO [(FilePath, FilePath)]
+findIgnoreFiles root relativeDirectory = do
+    let absoluteDirectory =
+            if null relativeDirectory
+                then root
+                else root </> relativeDirectory
+    names <- listDirectory absoluteDirectory
+    fmap concat $
+        traverse
+            (\name -> do
+                let relativePath =
+                        if null relativeDirectory
+                            then name
+                            else relativeDirectory </> name
+                    absolutePath = root </> relativePath
+                isDirectory <- doesDirectoryExist absolutePath
+                if name == ".git"
+                    then pure []
+                    else
+                        if isDirectory
+                            then findIgnoreFiles root relativePath
+                            else
+                                if name == ".gitignore"
+                                    then pure [(relativeDirectory, absolutePath)]
+                                    else pure []
+            )
+            names
+
+readRules :: FilePath -> FilePath -> IO [IgnoreRule]
+readRules baseDirectory path = do
     exists <- doesFileExist path
     if not exists
         then pure []
-        else concatMap mapMaybeRule . lines <$> readFile path
+        else concatMap (mapMaybeRule baseDirectory) . lines <$> readFile path
 
-mapMaybeRule :: String -> [IgnoreRule]
-mapMaybeRule line =
-    case parseRule line of
+mapMaybeRule :: FilePath -> String -> [IgnoreRule]
+mapMaybeRule baseDirectory line =
+    case parseRule baseDirectory line of
         Nothing -> []
         Just rule -> [rule]
 
-parseRule :: String -> Maybe IgnoreRule
-parseRule raw
+parseRule :: FilePath -> String -> Maybe IgnoreRule
+parseRule baseDirectory raw
     | null stripped = Nothing
     | "#" `isPrefixOf` stripped = Nothing
     | otherwise =
@@ -62,6 +96,7 @@ parseRule raw
                             , ignoreNegated = negated
                             , ignoreDirectoryOnly = directoryOnly
                             , ignoreAnchored = anchored
+                            , ignoreBaseDir = baseDirectory
                             }
   where
     stripped = trim raw
@@ -87,19 +122,32 @@ isIgnored rules path =
             else current
 
 ruleMatches :: IgnoreRule -> FilePath -> Bool
-ruleMatches rule path
-    | ignoreDirectoryOnly rule =
-        any (matchPattern rule) (parentPrefixes path)
-    | ignoreAnchored rule =
-        matchPattern rule path || any (matchPattern rule) (parentPrefixes path)
-    | '/' `elem` ignorePattern rule =
-        matchPattern rule path || any (matchPattern rule) (parentPrefixes path)
-    | otherwise =
-        any (matchPattern rule) (componentCandidates path)
+ruleMatches rule path =
+    case relativeToBase (ignoreBaseDir rule) path of
+        Nothing -> False
+        Just relativePath
+            | ignoreDirectoryOnly rule ->
+                any (matchPattern rule) (parentPrefixes relativePath)
+            | ignoreAnchored rule ->
+                matchPattern rule relativePath
+                    || any (matchPattern rule) (parentPrefixes relativePath)
+            | '/' `elem` ignorePattern rule ->
+                matchPattern rule relativePath
+                    || any (matchPattern rule) (parentPrefixes relativePath)
+            | otherwise ->
+                any (matchPattern rule) (componentCandidates relativePath)
   where
     componentCandidates value =
         splitComponents value ++ parentPrefixes value
     matchPattern rule candidate = globMatch (ignorePattern rule) candidate
+
+relativeToBase :: FilePath -> FilePath -> Maybe FilePath
+relativeToBase baseDirectory path
+    | null baseDirectory = Just path
+    | path == baseDirectory = Just ""
+    | (baseDirectory ++ "/") `isPrefixOf` path =
+        Just (drop (length baseDirectory + 1) path)
+    | otherwise = Nothing
 
 parentPrefixes :: FilePath -> [FilePath]
 parentPrefixes path =

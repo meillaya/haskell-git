@@ -78,6 +78,10 @@ ignoresUntrackedFiles =
         writeFile (temporaryDir </> "keep.o") "keep\n"
         createDirectoryIfMissing True (temporaryDir </> "build")
         writeFile (temporaryDir </> "build" </> "artifact") "built\n"
+        createDirectoryIfMissing True (temporaryDir </> "nested")
+        writeFile (temporaryDir </> "nested" </> ".gitignore") "*.log\n"
+        writeFile (temporaryDir </> "nested" </> "ignored.log") "log\n"
+        writeFile (temporaryDir </> "nested" </> "kept.txt") "kept\n"
         repository <- requireRepository temporaryDir
         store <- loadStore repository
         status <- statusRepository repository store
@@ -85,6 +89,8 @@ ignoresUntrackedFiles =
         assert (not ("?? build/artifact" `elem` status)) "build/ should be ignored"
         assert ("?? keep.o" `elem` status) "A later negation should unignore keep.o"
         assert ("?? .gitignore" `elem` status) ".gitignore itself should still be visible"
+        assert (not ("?? nested/ignored.log" `elem` status)) "A nested .gitignore should apply in its directory"
+        assert ("?? nested/kept.txt" `elem` status) "Non-ignored nested files should stay visible"
 
 resetsHard :: IO ()
 resetsHard =

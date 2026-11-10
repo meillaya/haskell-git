@@ -261,9 +261,10 @@ out, and pack index tables are loaded in full.
 - Pack files are streamed, but a single object is held in memory while it is
   read. Pack index tables are loaded in full.
 - Submodules are initialised with `clone --recurse-submodules`,
-  `submodule update --init [--recursive]`, and `submodule sync`; `submodule
-  add`, `deinit`, `foreach`, and `absorbgitdirs` are not implemented. A normal
-  clone still leaves empty submodule directories, matching git.
+  `submodule update --init [--recursive] [--remote]`, and `submodule sync`.
+  `submodule add`, `deinit`, and branch-aware `--remote` updates are
+  implemented; `foreach` and `absorbgitdirs` are not. A normal clone still
+  leaves empty submodule directories, matching git.
 - `fetch`, `push`, `pull`, `merge`, `rebase`, `checkout`, `switch`, `branch`,
   `status`, and `reset --hard` are implemented, including `merge --no-ff`,
   `merge --ff-only`, `pull --ff-only`, `rebase --onto`, `push
@@ -280,8 +281,8 @@ out, and pack index tables are loaded in full.
   receive-pack).
 - Reflogs are written for `HEAD` and local branches with generic
   `haskell-git` messages; they are not yet written by hooks or external tools.
-- `status` evaluates root `.gitignore` and `.git/info/exclude`; nested
-  `.gitignore` files are not yet consulted.
+- `status` evaluates `.gitignore` files at every directory level and
+  `.git/info/exclude`.
 
 ## Tests
 

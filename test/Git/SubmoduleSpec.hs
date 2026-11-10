@@ -8,12 +8,15 @@ import Git.Repo (Repository, findRepository)
 import Git.Store (loadStore)
 import Git.Submodule
     ( Submodule (..)
+    , addSubmodule
+    , deinitSubmodule
     , initialiseSubmodules
     , readSubmodules
     , resolveSubmoduleUrl
     , submoduleStatus
     , submoduleSync
     , updateSubmodules
+    , updateSubmodulesRemote
     )
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist)
 import System.FilePath ((</>))
@@ -30,6 +33,7 @@ run = do
     parsesGitmodules
     resolvesRelativeUrls
     clonesRecursively
+    addsAndDeinitialises
     reportsStatus
     updatesExistingSubmodule
 
@@ -102,9 +106,43 @@ clonesRecursively =
                 statusText <- runGit ["-C", destination, "submodule", "status"]
                 assert (not (null statusText)) "git submodule status should see the submodule"
                 submoduleSync repository
+                updateSubmodulesRemote repository store False
+                remoteStatus <- runGit ["-C", destination, "status", "--porcelain"]
+                assertEqual "" remoteStatus "submodule update --remote should leave the worktree clean"
                 configText <- readFile (destination </> ".git" </> "config")
                 assert ("[submodule \"sub\"]" `isInfixOf` configText) "submodule sync should write a submodule section"
                 assert ("url = " `isInfixOf` configText) "submodule sync should write the URL"
+
+addsAndDeinitialises :: IO ()
+addsAndDeinitialises =
+    withTempDirectory "haskell-git-submodule-add" $ \temporaryDir -> do
+        let subSource = temporaryDir </> "sub-source"
+            subServe = temporaryDir </> "sub-serve"
+            superRepo = temporaryDir </> "super"
+        _ <- createRepository subSource "sub.txt" "sub\n"
+        createDirectoryIfMissing True subServe
+        _ <- runGit ["clone", "-q", "--bare", subSource, subServe </> "sub.git"]
+        withHttpBackendServer subServe "sub.git" $ \subUrl -> do
+            _ <- runGit ["init", "-q", "-b", "main", superRepo]
+            _ <- runGit ["-C", superRepo, "config", "user.email", "ada@example.com"]
+            _ <- runGit ["-C", superRepo, "config", "user.name", "Ada"]
+            repository <- requireRepository superRepo
+            (path, _commitId) <- addSubmodule repository subUrl (Just "sub") (Just "main")
+            assertEqual "sub" path "addSubmodule should use the requested path"
+            modulesText <- readFile (superRepo </> ".gitmodules")
+            assert ("[submodule \"sub\"]" `isInfixOf` modulesText) ".gitmodules should get a section"
+            assert ("branch = main" `isInfixOf` modulesText) ".gitmodules should record the branch"
+            staged <- runGit ["-C", superRepo, "ls-files", "--stage"]
+            assert ("160000" `isInfixOf` staged) ("The superproject index should hold a gitlink; got " ++ show staged)
+            modulesDir <- doesDirectoryExist (superRepo </> ".git" </> "modules" </> "sub")
+            assert modulesDir "addSubmodule should move the git dir under .git/modules"
+            submodules <- readSubmodules repository
+            assertEqual (Just "main") (submoduleBranch (head submodules)) "The branch should parse back"
+            deinitSubmodule repository "sub"
+            worktreeGone <- doesFileExist (superRepo </> "sub" </> "sub.txt")
+            assert (not worktreeGone) "deinitSubmodule should remove the worktree"
+            modulesGone <- doesDirectoryExist (superRepo </> ".git" </> "modules" </> "sub")
+            assert (not modulesGone) "deinitSubmodule should remove the module git dir"
 
 reportsStatus :: IO ()
 reportsStatus =

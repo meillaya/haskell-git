@@ -1,5 +1,11 @@
 # Revision history
 
+## Unreleased
+
+- Nested `.gitignore` files are evaluated by `status`.
+- `submodule add`, `submodule deinit`, and branch-aware
+  `submodule update --remote` are implemented.
+
 ## 0.3.0.0 - 2026-11-09
 
 - Merge now performs a line-level diff3 and detects exact-content renames.
