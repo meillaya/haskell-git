@@ -5,6 +5,8 @@
 - Nested `.gitignore` files are evaluated by `status`.
 - `submodule add`, `submodule deinit`, and branch-aware
   `submodule update --remote` are implemented.
+- Checkout refuses trees containing `.git` components and refuses to write
+  through symlinked parent directories.
 
 ## 0.3.0.0 - 2026-11-09
 

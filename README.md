@@ -282,7 +282,8 @@ out, and pack index tables are loaded in full.
 - Reflogs are written for `HEAD` and local branches with generic
   `haskell-git` messages; they are not yet written by hooks or external tools.
 - `status` evaluates `.gitignore` files at every directory level and
-  `.git/info/exclude`.
+  `.git/info/exclude`. Checkout rejects `.git` tree components and refuses to
+  write through symlinked parent directories.
 
 ## Tests
 

@@ -157,6 +157,7 @@ blobPayload store entry = do
 writeWorktreeEntry :: Store -> Repository -> FilePath -> TreeEntry -> IO ()
 writeWorktreeEntry store repository relativePath entry = do
     validateRelativePath relativePath
+    ensureSafeParentDirectories repository relativePath
     let destinationPath = repositoryRootDir repository </> relativePath
     case treeEntryMode entry of
         Directory -> pure ()
@@ -198,9 +199,31 @@ validateRelativePath relativePath =
         components
             | any isDotComponent components ->
                 ioError (userError ("tree contains a dot path component: " ++ relativePath))
+            | any isGitComponent components ->
+                ioError (userError ("tree contains a .git path component: " ++ relativePath))
             | otherwise -> pure ()
   where
     isDotComponent component = component == "." || component == ".."
+    isGitComponent component = component == ".git"
+
+-- | Refuse to write through a symlinked parent directory. A malicious or
+-- stale worktree must not turn a tree path into a write outside the repository.
+ensureSafeParentDirectories :: Repository -> FilePath -> IO ()
+ensureSafeParentDirectories repository relativePath =
+    checkPrefixes (repositoryRootDir repository) (init (splitOn '/' relativePath))
+  where
+    checkPrefixes _ [] = pure ()
+    checkPrefixes parent (component : rest) = do
+        let path = parent </> component
+        safe <- doesPathExist path
+        if safe
+            then do
+                isLink <- pathIsSymbolicLink path
+                isDirectory <- doesDirectoryExist path
+                if isLink || not isDirectory
+                    then ioError (userError ("refusing to write through a non-directory path: " ++ relativePath))
+                    else checkPrefixes path rest
+            else pure ()
 
 -- | Create a branch at HEAD.
 createBranch :: Repository -> String -> IO ()

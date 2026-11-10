@@ -13,7 +13,21 @@ import Git.Worktree
     , resetHard
     , statusRepository
     )
-import System.Directory (createDirectoryIfMissing, doesFileExist)
+import Control.Exception (IOException, try)
+import Git.Object.Blob (blobFromBytes, blobToObject)
+import Git.Object.Loose (writeLooseObject)
+import Git.Object.Tree
+    ( TreeEntryMode (..)
+    , treeEntry
+    , treeToObject
+    )
+import System.Directory
+    ( createDirectoryIfMissing
+    , createFileLink
+    , createDirectory
+    , doesDirectoryExist
+    , doesFileExist
+    )
 import System.FilePath ((</>), takeDirectory)
 import TestSupport
     ( assert
@@ -29,6 +43,7 @@ run = do
     checksOutAnotherBranch
     reportsDirtyStatus
     ignoresUntrackedFiles
+    rejectsUnsafeTreePaths
     resetsHard
 
 checksOutAnotherBranch :: IO ()
@@ -91,6 +106,31 @@ ignoresUntrackedFiles =
         assert ("?? .gitignore" `elem` status) ".gitignore itself should still be visible"
         assert (not ("?? nested/ignored.log" `elem` status)) "A nested .gitignore should apply in its directory"
         assert ("?? nested/kept.txt" `elem` status) "Non-ignored nested files should stay visible"
+
+rejectsUnsafeTreePaths :: IO ()
+rejectsUnsafeTreePaths =
+    withTempDirectory "haskell-git-worktree-hardening" $ \temporaryDir -> do
+        _ <- createRepository temporaryDir
+        repository <- requireRepository temporaryDir
+        store <- loadStore repository
+        blobId <- writeLooseObject repository (blobToObject (blobFromBytes (BS8.pack "evil\n")))
+        configTree <- writeLooseObject repository (treeToObject [treeEntry RegularFile (BS8.pack "config") blobId])
+        dottedTree <- writeLooseObject repository (treeToObject [treeEntry Directory (BS8.pack ".git") configTree])
+        dottedResult <- try (checkoutTree repository store dottedTree) :: IO (Either IOException ())
+        case dottedResult of
+            Left _ -> pure ()
+            Right _ -> fail "checkout must refuse a tree containing .git"
+        let outside = temporaryDir </> "outside"
+        createDirectory outside
+        createFileLink outside (temporaryDir </> "link")
+        linkTree <- writeLooseObject repository (treeToObject [treeEntry RegularFile (BS8.pack "escape") blobId])
+        rootTree <- writeLooseObject repository (treeToObject [treeEntry Directory (BS8.pack "link") linkTree])
+        linkResult <- try (checkoutTree repository store rootTree) :: IO (Either IOException ())
+        case linkResult of
+            Left _ -> pure ()
+            Right _ -> fail "checkout must refuse to write through a symlinked directory"
+        escaped <- doesFileExist (outside </> "escape")
+        assert (not escaped) "checkout must not write outside the repository"
 
 resetsHard :: IO ()
 resetsHard =
