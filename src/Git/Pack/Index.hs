@@ -51,6 +51,7 @@ parsePackIndexFor hashAlgorithm bytes = do
     let hashLength = hashSize hashAlgorithm
         checksumPairLength = hashLength * 2
         minimumLength = fanoutOffset + fanoutEntryCount * 4 + checksumPairLength
+        objectIdStart = fanoutOffset + fanoutEntryCount * 4
     if BS.length bytes < minimumLength
         then Left "malformed pack index: file is too short"
         else pure ()
@@ -60,11 +61,10 @@ parsePackIndexFor hashAlgorithm bytes = do
 
     -- Layout: fanout table, sorted object ids, CRCs, 32-bit offsets, the
     -- 64-bit offsets the 32-bit table cannot hold, then two checksums.
-    let version = decodeWord32 (BS.take 4 (BS.drop 4 bytes))
+    let version = word32At bytes 4
         count =
             fromIntegral
-                (decodeWord32 (BS.take 4 (BS.drop (fanoutOffset + (fanoutEntryCount - 1) * 4) bytes)))
-        objectIdStart = fanoutOffset + fanoutEntryCount * 4
+                (word32At bytes (fanoutOffset + (fanoutEntryCount - 1) * 4))
         crcStart = objectIdStart + count * hashLength
         offsetStart = crcStart + count * 4
         largeOffsetStart = offsetStart + count * 4
@@ -76,7 +76,7 @@ parsePackIndexFor hashAlgorithm bytes = do
         else pure ()
 
     let rawOffsets =
-            [ decodeWord32 (BS.take 4 (BS.drop (offsetStart + index * 4) bytes))
+            [ word32At bytes (offsetStart + index * 4)
             | index <- [0 .. count - 1]
             ]
         largeOffsetCount = length (filter isLargeOffset rawOffsets)
@@ -89,23 +89,10 @@ parsePackIndexFor hashAlgorithm bytes = do
         then Left "malformed pack index: checksum mismatch"
         else pure ()
 
-    let buildEntry index = do
-            let rawOffset = rawOffsets !! index
-                objectIdPosition = objectIdStart + index * hashLength
-                crcPosition = crcStart + index * 4
-            objectId <-
-                maybe
-                    (Left "malformed pack index: invalid object id")
-                    Right
-                    (objectIdFromBytesFor hashAlgorithm (BS.take hashLength (BS.drop objectIdPosition bytes)))
-            offset <- resolveOffset bytes largeOffsetCount largeOffsetStart rawOffset
-            Right
-                PackIndexEntry
-                    { packIndexEntryObjectId = objectId
-                    , packIndexEntryOffset = offset
-                    , packIndexEntryCrc32 = decodeWord32 (BS.take 4 (BS.drop crcPosition bytes))
-                    }
-    entries <- traverse buildEntry [0 .. count - 1]
+    entries <-
+        traverse
+            (buildEntry hashAlgorithm bytes hashLength objectIdStart crcStart largeOffsetCount largeOffsetStart)
+            (zip [0 .. count - 1] rawOffsets)
     Right
         PackIndex
             { packIndexEntries = entries
@@ -116,6 +103,45 @@ parsePackIndexFor hashAlgorithm bytes = do
                     ]
             }
 
+buildEntry
+    :: HashAlgorithm
+    -> ByteString
+    -> Int
+    -> Int
+    -> Int
+    -> Int
+    -> Int
+    -> (Int, Word32)
+    -> Either String PackIndexEntry
+buildEntry hashAlgorithm bytes hashLength objectIdStart crcStart largeOffsetCount largeOffsetStart (index, rawOffset) = do
+    objectId <-
+        maybe
+            (Left "malformed pack index: invalid object id")
+            Right
+            ( objectIdFromBytesFor
+                hashAlgorithm
+                (BS.take hashLength (BS.drop (objectIdStart + index * hashLength) bytes))
+            )
+    offset <- resolveOffset bytes largeOffsetCount largeOffsetStart rawOffset
+    Right
+        PackIndexEntry
+            { packIndexEntryObjectId = objectId
+            , packIndexEntryOffset = offset
+            , packIndexEntryCrc32 = word32At bytes (crcStart + index * 4)
+            }
+
+word32At :: ByteString -> Int -> Word32
+word32At bytes offset =
+    (fromIntegral (BS.index bytes offset) `shiftL` 24)
+        .|. (fromIntegral (BS.index bytes (offset + 1)) `shiftL` 16)
+        .|. (fromIntegral (BS.index bytes (offset + 2)) `shiftL` 8)
+        .|. fromIntegral (BS.index bytes (offset + 3))
+
+word64At :: ByteString -> Int -> Word64
+word64At bytes offset =
+    (fromIntegral (word32At bytes offset) `shiftL` 32)
+        .|. fromIntegral (word32At bytes (offset + 4))
+
 resolveOffset :: ByteString -> Int -> Int -> Word32 -> Either String Int
 resolveOffset bytes largeOffsetCount largeOffsetStart rawOffset
     | not (isLargeOffset rawOffset) = Right (fromIntegral rawOffset)
@@ -124,19 +150,13 @@ resolveOffset bytes largeOffsetCount largeOffsetStart rawOffset
     | otherwise =
         Right
             ( fromIntegral
-                (decodeWord64 (BS.take 8 (BS.drop (largeOffsetStart + largeIndex * 8) bytes)))
+                (word64At bytes (largeOffsetStart + largeIndex * 8))
             )
   where
     largeIndex = fromIntegral (rawOffset .&. 0x7fffffff)
 
 isLargeOffset :: Word32 -> Bool
 isLargeOffset rawOffset = rawOffset .&. largeOffsetFlag /= 0
-
-decodeWord32 :: ByteString -> Word32
-decodeWord32 = BS.foldl' (\accumulator word -> (accumulator `shiftL` 8) .|. fromIntegral word) 0
-
-decodeWord64 :: ByteString -> Word64
-decodeWord64 = BS.foldl' (\accumulator word -> (accumulator `shiftL` 8) .|. fromIntegral word) 0
 
 packIndexMagic :: ByteString
 packIndexMagic = BS.pack [0xff, 0x74, 0x4f, 0x63]

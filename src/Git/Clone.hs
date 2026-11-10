@@ -39,7 +39,7 @@ import Git.Object.Tree
     , treeEntryObjectId
     )
 import Git.Pack.Import (importPackFile)
-import Git.Pack.Retain (retainPackFile)
+import Git.Pack.Retain (retainPackDirectly, retainPackFile)
 import Git.Protocol.SmartHTTP
     ( DiscoveryAdvertisement
     , DiscoveryRef
@@ -113,11 +113,12 @@ cloneInto remoteUrl destination = do
                         wantedIds
                         []
                         packPath
-                    importPackFile objectFormat repository packPath
-                    retainPackFile objectFormat repository packPath
+                    retainedDirectly <- retainPackDirectly objectFormat repository packPath
+                    when (not retainedDirectly) $ do
+                        importPackFile objectFormat repository packPath
+                        retainPackFile objectFormat repository packPath
                 store <- loadStore repository
-                checkoutTree store repository headObjectId
-                writeCheckoutIndex store repository headObjectId
+                checkoutTreeAndIndex store repository headObjectId
                 writeCloneRefs repository defaultBranchPath headObjectId branchRefs tagRefs
                 writeRemoteConfig repository remoteUrl defaultBranchPath
                 pure (CloneResult (Just headObjectId) defaultBranchPath)
@@ -181,21 +182,15 @@ symrefTarget advertisement = do
             | headName == BS8.pack "HEAD" && not (BS.null rest) -> Just (BS.tail rest)
         _ -> Nothing
 
-checkoutTree :: Store -> Repository -> ObjectId -> IO ()
-checkoutTree store repository headObjectId = do
-    flattened <- flattenHeadTree store headObjectId
-    forM_ flattened $ \(relativePath, entry) ->
-        materializeEntry store repository relativePath entry
-
-writeCheckoutIndex :: Store -> Repository -> ObjectId -> IO ()
-writeCheckoutIndex store repository headObjectId = do
+-- | Materialise the tree and write the version 2 index from the same payload
+-- reads. A clone needs both, and reading every blob twice for the size fields
+-- in the index is avoidable.
+checkoutTreeAndIndex :: Store -> Repository -> ObjectId -> IO ()
+checkoutTreeAndIndex store repository headObjectId = do
     flattened <- flattenHeadTree store headObjectId
     entries <- forM flattened $ \(relativePath, entry) -> do
-        size <- case treeEntryMode entry of
-            Gitlink -> pure 0
-            Directory -> pure 0
-            _ -> fromIntegral . BS.length <$> blobPayload store entry
-        pure (indexEntryFromTree relativePath entry size)
+        size <- materializeEntry store repository relativePath entry
+        pure (indexEntryFromTree relativePath entry (fromIntegral size))
     writeIndexFile
         (repositoryObjectFormat repository)
         (repositoryIndexPath repository)
@@ -215,13 +210,17 @@ flattenHeadTree store headObjectId = do
             (commitFromObjectFor (repositoryObjectFormat (storeRepository store)) headObject)
     flattenTree store (commitTree currentCommit)
 
-materializeEntry :: Store -> Repository -> FilePath -> TreeEntry -> IO ()
+-- | Materialise one tree entry and return its index size (the blob length for
+-- files and symlinks, zero for directories and submodule entries).
+materializeEntry :: Store -> Repository -> FilePath -> TreeEntry -> IO Int
 materializeEntry store repository relativePath entry = do
     validateRelativePath relativePath
     let destinationPath = repositoryRootDir repository </> relativePath
     case treeEntryMode entry of
-        Directory -> pure ()
-        Gitlink -> createDirectoryIfMissing True destinationPath
+        Directory -> pure 0
+        Gitlink -> do
+            createDirectoryIfMissing True destinationPath
+            pure 0
         RegularFile -> writeBlob destinationPath False
         ExecutableFile -> writeBlob destinationPath True
         Symlink -> do
@@ -229,6 +228,7 @@ materializeEntry store repository relativePath entry = do
             createDirectoryIfMissing True (takeDirectory destinationPath)
             removePathIfPresent destinationPath
             createFileLink (BS8.unpack target) destinationPath
+            pure (BS.length target)
   where
     writeBlob destinationPath isExecutable = do
         payload <- blobPayload store entry
@@ -239,6 +239,7 @@ materializeEntry store repository relativePath entry = do
                 permissions <- getPermissions destinationPath
                 setPermissions destinationPath (permissions {executable = True})
             else pure ()
+        pure (BS.length payload)
 
 blobPayload :: Store -> TreeEntry -> IO ByteString
 blobPayload store entry = do

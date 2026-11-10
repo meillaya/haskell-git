@@ -40,7 +40,7 @@ import Git.Object.Commit (Commit, commitFromObjectFor, commitParents)
 import Git.Object.Loose
     ( listLooseObjectIds
     , looseObjectPath
-    , objectIdForObjectFor
+    , objectIdForPayloadFor
     , readLooseObject
     )
 import Git.Object.Tree
@@ -61,7 +61,7 @@ import Git.Pack.Index
     , parsePackIndexFor
     )
 import Git.Pack.Read (PackRawObject (..))
-import Git.Pack.Stream (readPackHeaderFromFile, readPackObjectAtFile, validatePackFile)
+import Git.Pack.Stream (readPackHeaderFromFile, readPackObjectAtFile)
 import Git.Repo (Repository (..), repositoryObjectsDir)
 
 data PackFile = PackFile
@@ -106,7 +106,6 @@ loadStore repository = do
                 then ioError (userError ("missing pack file for " ++ indexPath))
                 else pure ()
             header <- readPackHeaderFromFile packPath
-            validatePackFile objectFormat packPath
             if packHeaderObjectCount header /= length (packIndexEntries packIndex)
                 then ioError (userError ("pack index does not match the pack object count: " ++ packPath))
                 else pure ()
@@ -218,7 +217,7 @@ readFromPacks store depth objectId = go (storePacks store)
                 case result of
                     Left err -> pure (Left err)
                     Right gitObjectValue ->
-                        if objectIdForObjectFor objectFormat gitObjectValue /= objectId
+                        if objectIdForPayloadFor objectFormat (gitObjectType gitObjectValue) (gitObjectPayload gitObjectValue) /= objectId
                             then
                                 pure
                                     ( Left

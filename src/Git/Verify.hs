@@ -9,6 +9,7 @@ import Control.Monad (forM)
 import Git.Hash (ObjectId, objectIdToHex)
 import Git.Object.Loose (listLooseObjectIds, objectIdForObjectFor, readLooseObject)
 import Git.Pack.Index (packIndexObjectIds)
+import Git.Pack.Stream (validatePackFile)
 import Git.Refs (listRefs, resolveHeadReference)
 import Git.Repo (Repository, repositoryObjectFormat)
 import Git.Store
@@ -46,13 +47,14 @@ verifyRepository repository = do
         Right store -> do
             let packedObjectIds =
                     concatMap (packIndexObjectIds . packFileIndex) (storePacks store)
+            packProblems <- fmap concat (forM (storePacks store) (verifyPackTrailer repository))
             packedProblems <- fmap concat (forM packedObjectIds (verifyPackedObject store))
             (refProblems, refCount) <- verifyReferences repository store
             pure
                 VerifyReport
                     { verifyObjectCount = length looseObjectIds + length packedObjectIds
                     , verifyRefCount = refCount
-                    , verifyProblems = looseProblems ++ packedProblems ++ refProblems
+                    , verifyProblems = looseProblems ++ packProblems ++ packedProblems ++ refProblems
                     }
 
 verifyLooseObject :: Repository -> ObjectId -> IO [String]
@@ -64,6 +66,13 @@ verifyLooseObject repository objectId = do
             if objectIdForObjectFor (repositoryObjectFormat repository) gitObjectValue == objectId
                 then pure []
                 else pure [objectIdToHex objectId ++ ": content does not hash to its file name"]
+
+verifyPackTrailer :: Repository -> PackFile -> IO [String]
+verifyPackTrailer repository pack = do
+    attempt <- try (validatePackFile (repositoryObjectFormat repository) (packFilePath pack))
+    case attempt of
+        Left err -> pure [packFilePath pack ++ ": " ++ ioeGetErrorString err]
+        Right () -> pure []
 
 verifyPackedObject :: Store -> ObjectId -> IO [String]
 verifyPackedObject store objectId = do

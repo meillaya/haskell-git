@@ -6,6 +6,7 @@ module Git.Hash
     , hashAlgorithmName
     , hashBytes
     , hashBytesFor
+    , hashPartsFor
     , hashSize
     , isZeroObjectId
     , objectIdBytes
@@ -70,6 +71,15 @@ hashBytes = hashBytesFor Sha1
 hashBytesFor :: HashAlgorithm -> ByteString -> ObjectId
 hashBytesFor Sha1 = ObjectId . SHA1.hash
 hashBytesFor Sha256 = ObjectId . SHA256.hash
+
+-- | Hash the concatenation of two byte strings without building the
+-- intermediate copy. Object ids hash a small header followed by the payload,
+-- so this avoids copying every object during clone.
+hashPartsFor :: HashAlgorithm -> ByteString -> ByteString -> ObjectId
+hashPartsFor Sha1 first second =
+    ObjectId (SHA1.finalize (SHA1.update (SHA1.update SHA1.init first) second))
+hashPartsFor Sha256 first second =
+    ObjectId (SHA256.finalize (SHA256.update (SHA256.update SHA256.init first) second))
 
 zeroObjectIdFor :: HashAlgorithm -> ObjectId
 zeroObjectIdFor hashAlgorithm =

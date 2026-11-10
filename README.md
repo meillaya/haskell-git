@@ -240,9 +240,14 @@ entry's own offset.
 The clone pipeline turns an advertisement and a pack stream into a repository
 over HTTP(S), SSH, or git://. A pkt-line frame is four hex digits of length and
 the payload, `want` lines name the object ids the client needs, and the server
-answers with a streamed pack. The pack is spooled to a temporary file,
-checksummed, and imported incrementally; resolved objects become loose objects,
-then refs, the index, and the working tree.
+answers with a streamed pack. The pack is spooled to a temporary file and
+checksummed. A self-contained pack is then indexed in a single streaming pass
+and retained directly under `.git/objects/pack`: delta bases are resolved
+through a temporary uncompressed object cache, so the clone path never writes,
+re-reads, and deletes every object as a loose file. Thin packs fall back to
+importing resolved objects as loose objects. Refs, the index, and the working
+tree are written from the retained pack; checkout and index generation share
+one payload read per file.
 
 ![Clone flow](docs/figures/clone-flow.png)
 
@@ -260,13 +265,14 @@ boundary, and the file ends with the repository hash. The stat fields are left
 as zero: git treats a zero size as "hash the file and compare", so a fresh
 checkout is clean and git fills the stat fields in on the next status.
 
-Pack files are read through file handles and streamed into the importer; a
-clone or fetch spools the response to a temporary pack file and never keeps
-the whole pack in memory. Resolved delta bases are cached in a bounded memo
-table. Self-contained packs are then retained under `.git/objects/pack` with
-a v2 pack index, and the loose duplicates are removed; thin packs stay as
-loose objects. A single object must still fit in memory while it is read or
-checked out, and pack index tables are loaded in full.
+Pack files are read through file handles and streamed; a clone or fetch spools
+the response to a temporary pack file and never keeps the whole pack in memory.
+Resolved delta bases are cached in a bounded memo table; a clone also resolves
+them from the temporary uncompressed cache, so a retained pack is built without
+materialising loose objects. Self-contained packs are retained under
+`.git/objects/pack` with a v2 pack index, and thin packs stay as loose objects.
+A single object must still fit in memory while it is read or checked out, and
+pack index tables are loaded in full.
 
 ## Limits
 
@@ -285,7 +291,9 @@ checked out, and pack index tables are loaded in full.
   dual-hash `compatObjectFormat` repository is refused.
 - Pack files are streamed, but a single object is held in memory while it is
   read. Pack index tables are loaded in full. Thin packs are not converted
-  into retained packs; their loose objects are kept.
+  into retained packs; their loose objects are kept. Pack trailer checksums are
+  verified when a pack is retained, after every fetch, and by `verify`; opening
+  an existing object store does not re-hash whole packs.
 - Submodules are initialised with `clone --recurse-submodules`,
   `submodule update --init [--recursive] [--remote]`, and `submodule sync`.
   `submodule add`, `deinit`, and branch-aware `--remote` updates are
@@ -300,8 +308,6 @@ checked out, and pack index tables are loaded in full.
 - Merge uses a line-level diff3 and detects exact-content renames, plus
   renames whose contents changed by at least 50% similarity. Conflicts are
   still resolved at file granularity.
-- Fetch sends `have` lines for a compact negotiation and auto-follows tags
-  reachable from fetched branches; `--tags` fetches every tag.
 - Push works over Smart HTTP, SSH, and git:// (the daemon must enable
   receive-pack).
 - Reflogs are written for `HEAD` and local branches with generic

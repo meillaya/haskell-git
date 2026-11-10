@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Clone indexes a self-contained pack in one streaming pass and retains it
+  directly, resolving delta bases through a temporary uncompressed object
+  cache instead of writing, re-reading, and deleting every object as a loose
+  file. Checkout and index generation share one payload read per file. Large
+  clones are several times faster.
+- Pack index parsing is linear rather than quadratic, so opening an existing
+  object store is fast for large repositories. Pack trailer checksums are now
+  verified when a pack is retained, after a fetch, and by `verify`, instead of
+  on every store open.
+- Loose objects are compressed at zlib level 1, matching git's default for
+  loose objects.
 - A Nix flake packages the CLI and library and provides a dev shell, an
   overlay, and NixOS and Home Manager modules (`programs.haskell-git.enable`).
 - Nested `.gitignore` files are evaluated by `status`.

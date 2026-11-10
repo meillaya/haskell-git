@@ -7,6 +7,7 @@ module Git.Object.Loose
     , looseObjectType
     , objectIdForObject
     , objectIdForObjectFor
+    , objectIdForPayloadFor
     , readLooseObject
     , writeLooseObject
     ) where
@@ -39,13 +40,22 @@ import Git.Hash
     , ObjectId
     , hashBytes
     , hashBytesFor
+    , hashPartsFor
     , objectIdBytes
     , objectIdFromHexFor
     , objectIdLengthFor
     , objectIdPath
     , objectIdToHex
     )
-import Git.Object (GitObject, GitObjectType, decodeGitObject, encodeGitObject)
+import Git.Object
+    ( GitObject
+    , GitObjectType
+    , decodeGitObject
+    , encodeGitObject
+    , gitObjectPayload
+    , gitObjectType
+    , objectTypeName
+    )
 import Git.Repo (Repository (..), repositoryObjectsDir)
 
 data LooseObject = LooseObject
@@ -63,13 +73,28 @@ objectIdForObject = hashBytes . encodeGitObject
 objectIdForObjectFor :: HashAlgorithm -> GitObject -> ObjectId
 objectIdForObjectFor hashAlgorithm = hashBytesFor hashAlgorithm . encodeGitObject
 
+-- | The object id for a payload without building the full encoded object.
+-- Git hashes @type SP size NUL payload@; the header is hashed first and the
+-- payload streamed into the hash, so a clone does not copy every object.
+objectIdForPayloadFor :: HashAlgorithm -> GitObjectType -> ByteString -> ObjectId
+objectIdForPayloadFor hashAlgorithm objectType payload =
+    hashPartsFor hashAlgorithm header payload
+  where
+    header =
+        BS8.pack (objectTypeName objectType ++ " " ++ show (BS.length payload))
+            <> BS.singleton 0
+
 -- | Write one object as a zlib-compressed loose file. The write goes through a
 -- temporary file and a rename so an interrupted process cannot leave a
 -- truncated object under a valid id, and an existing object is left alone.
 writeLooseObject :: Repository -> GitObject -> IO ObjectId
 writeLooseObject repository currentObject = do
     let encodedObject = encodeGitObject currentObject
-        objectId = objectIdForObjectFor (repositoryObjectFormat repository) currentObject
+        objectId =
+            objectIdForPayloadFor
+                (repositoryObjectFormat repository)
+                (gitObjectType currentObject)
+                (gitObjectPayload currentObject)
         objectPath = looseObjectPath repository objectId
         objectDirectory = takeDirectory objectPath
     createDirectoryIfMissing True objectDirectory
@@ -79,7 +104,7 @@ writeLooseObject repository currentObject = do
         else do
             (temporaryPath, handle) <-
                 openTempFile objectDirectory (takeFileName objectPath ++ ".tmp")
-            BL.hPut handle (Zlib.compress (BL.fromStrict encodedObject))
+            BL.hPut handle (Zlib.compressWith Zlib.defaultCompressParams {Zlib.compressLevel = Zlib.CompressionLevel 1} (BL.fromStrict encodedObject))
             hClose handle
             renameFile temporaryPath objectPath
             permissions <- getPermissions objectPath
